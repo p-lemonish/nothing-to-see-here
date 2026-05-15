@@ -1,5 +1,7 @@
 # OLD, works with default kova-wfb-rs
 ```bash
+iw dev
+# take note of RX and TX NIC of wifi dongles
 export RXNIC=wlx5cffffaba18f
 export TXNIC=wlx5cffffabb301
 

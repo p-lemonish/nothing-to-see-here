@@ -1,3 +1,4 @@
+# OLD, works with default kova-wfb-rs
 ```bash
 export RXNIC=wlx5cffffaba18f
 export TXNIC=wlx5cffffabb301

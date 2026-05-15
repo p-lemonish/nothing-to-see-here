@@ -299,12 +299,211 @@ stable:
 These may be useful later for directed critical commands or larger transfers,
 but they should not be the default mesh mode.
 
+## Next Phase: Security, Compression, And Status
+
+The mesh transport now works at a simple UDP-like level. The next phase should
+improve operational usefulness without changing the radio layer or adding ACKs.
+
+Implementation order:
+
+1. Mesh log ergonomics.
+2. AEAD secure payload wrapper.
+3. Config-based shared keys.
+4. Authenticated mesh forwarding.
+5. Optional compression.
+6. Structured status payloads.
+
+### 1. Mesh Log Ergonomics
+
+Add config options:
+
+```ini
+log_level = info
+quiet_duplicates = true
+```
+
+Suggested behavior:
+
+- `debug`: print invalid frames, duplicates, own-route drops, forwards, delivers.
+- `info`: print local deliveries, local sends, forwards, auth failures.
+- `quiet_duplicates = true`: suppress duplicate route drop lines.
+
+This should be implemented before crypto so three-node tests remain readable.
+
+### 2. AEAD Secure Payload Wrapper
+
+Add encryption/authentication as an inner payload wrapper. Do not change the
+10-byte base app header and do not change the `route_data` wrapper.
+
+Use:
+
+```text
+ChaCha20-Poly1305
+```
+
+Secure payload wrapper:
+
+```text
+offset  size  field
+0       4     key_id
+4       12    nonce
+16      N     ciphertext_and_tag
+```
+
+`ciphertext_and_tag` contains the encrypted inner payload plus the AEAD tag.
+
+Associated data must include all unencrypted metadata that must not be tampered
+with:
+
+For direct app frames:
+
+```text
+version, message_type, sender_id, flags, app_seq, payload_len
+```
+
+For routed frames, include both the outer app header and route wrapper metadata:
+
+```text
+outer app header
+origin_sender_id
+destination_id
+ttl
+origin_seq
+inner_type
+inner_payload_len
+```
+
+Rules:
+
+- Drop frames that fail AEAD authentication.
+- Do not deliver unauthenticated secure payloads.
+- Do not forward unauthenticated `route_data`.
+- Keep routing metadata visible for forwarding, but authenticated.
+- Keep actual application payload confidential.
+
+### 3. Config-Based Shared Keys
+
+Start with static shared keys in config files for hackathon speed.
+
+Config example:
+
+```ini
+secure = true
+key_id = 1
+key_hex = 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+```
+
+Rules:
+
+- `key_hex` must decode to 32 bytes for ChaCha20-Poly1305.
+- `key_id` is sent in the secure wrapper.
+- Receivers choose the right key by `key_id`.
+- Do not print keys in logs.
+- Keep keys out of packet captures and screenshots.
+
+Nonce strategy for v1:
+
+```text
+nonce = sender_id(1 byte) || app_seq(4 bytes) || origin_seq_or_zero(4 bytes) || counter(3 bytes)
+```
+
+This is simple but must still guarantee no nonce reuse for the same key. If this
+gets complicated, use a random 96-bit nonce and accept the tiny collision risk
+for the hackathon demo.
+
+### 4. Authenticated Mesh Forwarding
+
+For `route_data`, forwarding nodes must be able to authenticate route metadata
+before forwarding.
+
+Recommended first version:
+
+- encrypt only `inner_payload`
+- authenticate route metadata as associated data
+- keep `origin_sender_id`, `destination_id`, `ttl`, `origin_seq`, and
+  `inner_type` visible
+- decrement TTL during forwarding
+- after decrementing TTL, re-wrap/re-authenticate with the forwarding node's key
+
+This means each hop authenticates what it forwards. It is simpler than trying to
+preserve an end-to-end tag across TTL mutation.
+
+Later, add end-to-end payload auth if needed:
+
+- inner origin authentication tag over original payload
+- hop authentication tag over mutable route metadata
+
+### 5. Optional Compression
+
+Add compression only after AEAD is working.
+
+Reason:
+
+- Tiny status/hello messages may get larger when compressed.
+- Compression is an optimization, not a safety feature.
+- Compression can leak information in some designs if attacker-controlled text
+  is compressed with secrets.
+
+Config:
+
+```ini
+compression = none
+compress_min_bytes = 128
+```
+
+Initial options:
+
+```text
+none
+zstd
+```
+
+Rules:
+
+- Compress before encryption.
+- Do not compress payloads below `compress_min_bytes`.
+- Include compression mode in authenticated metadata or in a small encrypted
+  payload header.
+- Start with `none` as default.
+
+### 6. Structured Status Payload
+
+Replace free-text status messages with a small binary status payload once secure
+transport is stable.
+
+V1 status payload:
+
+```text
+offset  size  field
+0       1     status_version
+1       4     uptime_s
+5       1     battery_pct, 255 means unknown
+6       1     peer_count
+7       1     flags
+```
+
+Possible flags:
+
+```text
+0x01 = degraded_link
+0x02 = low_battery
+0x04 = crypto_enabled
+0x08 = forwarding_enabled
+```
+
+Later status fields:
+
+- last-heard peer summaries
+- RSSI summaries
+- retry/loss estimates
+- GPS/position if available
+
 ## Next Implementation Steps
 
-1. Keep testing `simple_txrx.py --app-proto` across two or three dongles.
-2. Keep testing `mesh_txrx.py` across three dongles with `ttl=2`.
-3. Tune `configs/node*.ini` for each physical node's `iface` and `sender_id`.
-4. Add `status` payload examples for node health and last-heard reporting.
-5. Add optional repeated sends for important datagrams.
-6. Add CRC32C wrapper only after the UDP-like path is stable.
-7. Add AEAD encryption/authentication after message flow and key handling are clear.
+1. Add `log_level` and `quiet_duplicates` to `mesh_txrx.py` and config files.
+2. Add secure payload encode/decode helpers and tests.
+3. Add config parsing for `secure`, `key_id`, and `key_hex`.
+4. Add authenticated encryption for routed inner payloads.
+5. Ensure unauthenticated secure frames are dropped and not forwarded.
+6. Add optional compression after encryption works.
+7. Add structured status payloads after secure transport is stable.

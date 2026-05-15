@@ -14,15 +14,19 @@ MSG_HELLO = 0x01
 MSG_TEXT = 0x02
 MSG_DATA = 0x03
 MSG_STATUS = 0x04
+MSG_ROUTE_DATA = 0x21
 
 MESSAGE_TYPES: dict[str, int] = {
     "hello": MSG_HELLO,
     "text": MSG_TEXT,
     "data": MSG_DATA,
     "status": MSG_STATUS,
+    "route_data": MSG_ROUTE_DATA,
 }
 
 MESSAGE_TYPE_NAMES = {value: name for name, value in MESSAGE_TYPES.items()}
+ROUTE_DATA_PAYLOAD = struct.Struct("!BBBIBH")
+ROUTE_DATA_PAYLOAD_SIZE = ROUTE_DATA_PAYLOAD.size
 
 
 class AppFrameError(ValueError):
@@ -41,6 +45,36 @@ class AppFrame:
     @property
     def message_type_name(self) -> str:
         return message_type_name(self.message_type)
+
+
+@dataclass(frozen=True)
+class RouteData:
+    origin_sender_id: int
+    destination_id: int
+    ttl: int
+    origin_seq: int
+    inner_type: int
+    inner_payload: bytes
+
+    @property
+    def inner_type_name(self) -> str:
+        return message_type_name(self.inner_type)
+
+    @property
+    def dedupe_key(self) -> tuple[int, int]:
+        return (self.origin_sender_id, self.origin_seq)
+
+    def decremented_ttl(self) -> "RouteData":
+        if self.ttl <= 0:
+            raise AppFrameError("cannot decrement route_data ttl below zero")
+        return RouteData(
+            origin_sender_id=self.origin_sender_id,
+            destination_id=self.destination_id,
+            ttl=self.ttl - 1,
+            origin_seq=self.origin_seq,
+            inner_type=self.inner_type,
+            inner_payload=self.inner_payload,
+        )
 
 
 def _require_u8(name: str, value: int) -> None:
@@ -94,6 +128,80 @@ def encode_frame(
         raise AppFrameError(f"payload too large for u16 length: {len(payload)}")
 
     return HEADER.pack(VERSION, msg_type, sender_id, flags, app_seq, len(payload)) + payload
+
+
+def encode_route_data_payload(
+    *,
+    origin_sender_id: int,
+    destination_id: int,
+    ttl: int,
+    origin_seq: int,
+    inner_type: str | int,
+    inner_payload: bytes,
+) -> bytes:
+    if origin_sender_id == 0:
+        raise AppFrameError("origin_sender_id 0 is reserved")
+    _require_u8("origin_sender_id", origin_sender_id)
+    _require_u8("destination_id", destination_id)
+    _require_u8("ttl", ttl)
+    _require_u32("origin_seq", origin_seq)
+    msg_type = message_type_value(inner_type)
+    if msg_type == MSG_ROUTE_DATA:
+        raise AppFrameError("route_data cannot carry nested route_data")
+    if len(inner_payload) > MAX_U16:
+        raise AppFrameError(
+            f"inner_payload too large for u16 length: {len(inner_payload)}"
+        )
+
+    return (
+        ROUTE_DATA_PAYLOAD.pack(
+            origin_sender_id,
+            destination_id,
+            ttl,
+            origin_seq,
+            msg_type,
+            len(inner_payload),
+        )
+        + inner_payload
+    )
+
+
+def decode_route_data_payload(payload: bytes) -> RouteData:
+    if len(payload) < ROUTE_DATA_PAYLOAD_SIZE:
+        raise AppFrameError(
+            f"route_data payload too short: {len(payload)} < {ROUTE_DATA_PAYLOAD_SIZE}"
+        )
+
+    (
+        origin_sender_id,
+        destination_id,
+        ttl,
+        origin_seq,
+        inner_type,
+        inner_payload_len,
+    ) = ROUTE_DATA_PAYLOAD.unpack_from(payload)
+    inner_payload = payload[ROUTE_DATA_PAYLOAD_SIZE:]
+
+    if origin_sender_id == 0:
+        raise AppFrameError("origin_sender_id 0 is reserved")
+    if inner_payload_len != len(inner_payload):
+        raise AppFrameError(
+            "inner_payload_len mismatch: "
+            f"header={inner_payload_len} actual={len(inner_payload)}"
+        )
+    if inner_type == MSG_ROUTE_DATA:
+        raise AppFrameError("route_data cannot carry nested route_data")
+    if inner_type not in MESSAGE_TYPE_NAMES:
+        raise AppFrameError(f"unknown route_data inner_type: 0x{inner_type:02x}")
+
+    return RouteData(
+        origin_sender_id=origin_sender_id,
+        destination_id=destination_id,
+        ttl=ttl,
+        origin_seq=origin_seq,
+        inner_type=inner_type,
+        inner_payload=inner_payload,
+    )
 
 
 def decode_frame(frame: bytes, *, allow_unknown_message_type: bool = False) -> AppFrame:

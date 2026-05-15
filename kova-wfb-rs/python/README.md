@@ -81,6 +81,32 @@ sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py \
   --message "hello world" --message-type hello --count 0 --tx-interval-ms 1000
 ```
 
+TTL-limited mesh flooding uses the `route_data` wrapper. Run this on each relay
+or receiver node with a unique sender id:
+
+```bash
+sudo -E "$VIRTUAL_ENV/bin/python" examples/mesh_txrx.py \
+  --iface "$NIC" --stream-id 1 --sender-id 67
+```
+
+To originate a broadcast routed message:
+
+```bash
+sudo -E "$VIRTUAL_ENV/bin/python" examples/mesh_txrx.py \
+  --iface "$NIC" --stream-id 1 --sender-id 42 \
+  --message "battery=91" --message-type status --destination-id 0 \
+  --ttl 2 --count 0 --tx-interval-ms 1000
+```
+
+For normal multi-node testing, prefer config files. Edit each file's `iface`
+from `iw dev`, then run:
+
+```bash
+sudo -E "$VIRTUAL_ENV/bin/python" examples/mesh_txrx.py --config ../configs/node1.ini
+sudo -E "$VIRTUAL_ENV/bin/python" examples/mesh_txrx.py --config ../configs/node2.ini
+sudo -E "$VIRTUAL_ENV/bin/python" examples/mesh_txrx.py --config ../configs/node3.ini
+```
+
 ## Tests
 
 ```bash

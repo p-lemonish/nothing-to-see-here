@@ -11,6 +11,7 @@ from wfb_rs_py import Rx, Tx
 from wfb_rs_py.app_proto import (
     AppFrameError,
     MESSAGE_TYPE_NAMES,
+    MSG_ROUTE_DATA,
     MSG_TEXT,
     decode_frame,
     encode_frame,
@@ -240,7 +241,7 @@ def main() -> int:
             msg_type = message_type_value(args.message_type)
         except AppFrameError as exc:
             parser.error(str(exc))
-        if msg_type not in MESSAGE_TYPE_NAMES:
+        if msg_type not in MESSAGE_TYPE_NAMES or msg_type == MSG_ROUTE_DATA:
             parser.error(
                 "--message-type must be one of hello, text, data, or status for app protocol mode"
             )

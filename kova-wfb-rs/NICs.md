@@ -1,4 +1,9 @@
 ```bash
+sudo python/.venv/bin/python python/examples/mesh_txrx.py --config configs/node1.ini
+sudo python/.venv/bin/python python/examples/mesh_txrx.py --config configs/node2.ini
+sudo python/.venv/bin/python python/examples/mesh_txrx.py --config configs/node3.ini
+```
+```bash
 iw dev
 # take note of RX and TX NIC of wifi dongles
 export RXNIC=wlx5cffffaba18f # use your own..
@@ -6,6 +11,7 @@ export TXNIC=wlx5cffffabb301 # use your own..
 ```
 
 Run this to get both ifaces into monitor mode and up (on ch36)
+
 ```bash
 sudo nmcli dev set "$TXNIC" managed no
 sudo ip link set "$TXNIC" down
@@ -20,7 +26,6 @@ sudo iw dev "$RXNIC" set type monitor
 sudo ip link set "$RXNIC" up
 sudo iw dev "$RXNIC" set channel 36 HT20
 sudo iw dev "$RXNIC" set power_save off
-
 ```
 
 ```bash

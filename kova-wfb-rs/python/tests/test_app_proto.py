@@ -4,9 +4,14 @@ from wfb_rs_py.app_proto import (
     AppFrameError,
     HEADER_SIZE,
     MSG_HELLO,
+    MSG_ROUTE_DATA,
+    MSG_STATUS,
+    ROUTE_DATA_PAYLOAD_SIZE,
     VERSION,
     decode_frame,
+    decode_route_data_payload,
     encode_frame,
+    encode_route_data_payload,
     message_type_name,
     message_type_value,
 )
@@ -103,3 +108,112 @@ def test_message_type_value(raw, expected):
 def test_message_type_name():
     assert message_type_name(MSG_HELLO) == "hello"
     assert message_type_name(0x99) == "0x99"
+
+
+def test_encode_decode_route_data_payload():
+    encoded = encode_route_data_payload(
+        origin_sender_id=42,
+        destination_id=0,
+        ttl=3,
+        origin_seq=500,
+        inner_type="status",
+        inner_payload=b"battery=91",
+    )
+
+    route = decode_route_data_payload(encoded)
+
+    assert len(encoded) == ROUTE_DATA_PAYLOAD_SIZE + len(b"battery=91")
+    assert route.origin_sender_id == 42
+    assert route.destination_id == 0
+    assert route.ttl == 3
+    assert route.origin_seq == 500
+    assert route.inner_type == MSG_STATUS
+    assert route.inner_type_name == "status"
+    assert route.inner_payload == b"battery=91"
+    assert route.dedupe_key == (42, 500)
+
+
+def test_route_data_ttl_decrement():
+    route = decode_route_data_payload(
+        encode_route_data_payload(
+            origin_sender_id=42,
+            destination_id=7,
+            ttl=2,
+            origin_seq=10,
+            inner_type="data",
+            inner_payload=b"x",
+        )
+    )
+
+    forwarded = route.decremented_ttl()
+
+    assert forwarded.ttl == 1
+    assert forwarded.origin_sender_id == route.origin_sender_id
+    assert forwarded.destination_id == route.destination_id
+    assert forwarded.origin_seq == route.origin_seq
+    assert forwarded.inner_type == route.inner_type
+    assert forwarded.inner_payload == route.inner_payload
+
+
+def test_route_data_ttl_decrement_zero_is_invalid():
+    route = decode_route_data_payload(
+        encode_route_data_payload(
+            origin_sender_id=42,
+            destination_id=0,
+            ttl=0,
+            origin_seq=10,
+            inner_type="data",
+            inner_payload=b"x",
+        )
+    )
+
+    with pytest.raises(AppFrameError, match="ttl below zero"):
+        route.decremented_ttl()
+
+
+def test_route_data_sender_zero_is_invalid():
+    with pytest.raises(AppFrameError, match="origin_sender_id 0"):
+        encode_route_data_payload(
+            origin_sender_id=0,
+            destination_id=0,
+            ttl=1,
+            origin_seq=1,
+            inner_type="status",
+            inner_payload=b"",
+        )
+
+
+def test_route_data_short_payload_is_invalid():
+    with pytest.raises(AppFrameError, match="payload too short"):
+        decode_route_data_payload(b"short")
+
+
+def test_route_data_inner_length_mismatch_is_invalid():
+    encoded = encode_route_data_payload(
+        origin_sender_id=1,
+        destination_id=0,
+        ttl=1,
+        origin_seq=1,
+        inner_type="status",
+        inner_payload=b"abc",
+    )
+
+    with pytest.raises(AppFrameError, match="inner_payload_len mismatch"):
+        decode_route_data_payload(encoded[:-1])
+
+
+def test_route_data_cannot_nest_route_data():
+    with pytest.raises(AppFrameError, match="nested route_data"):
+        encode_route_data_payload(
+            origin_sender_id=1,
+            destination_id=0,
+            ttl=1,
+            origin_seq=1,
+            inner_type=MSG_ROUTE_DATA,
+            inner_payload=b"",
+        )
+
+
+def test_route_data_message_type_is_known():
+    assert message_type_value("route_data") == MSG_ROUTE_DATA
+    assert message_type_name(MSG_ROUTE_DATA) == "route_data"

@@ -1232,6 +1232,97 @@ Received sync logs compare the peer's UTC time, slot, and channel against the
 local node. This does not discipline the local clock; NTP is still the clock
 source.
 
+### 19. Image Payloads Over C2 Uplink
+
+Replace text-only C2 uplink payloads with small raw binary image frames.
+The end goal is a low-rate video feed from a drone to C2; the first step is
+single-frame 32x32 images sent one per uplink interval.
+
+#### Binary Frame Format
+
+All multi-byte fields are big-endian.
+
+```text
+offset  size  field
+0       4     magic: "KOVA" (0x4B4F5641)
+4       1     width (u8)
+5       1     height (u8)
+6       1     pixel_format: 0=grayscale, 1=RGB
+7       N     pixel data, row-major
+```
+
+Size budget:
+- 32x32 RGB: 6 header + 3072 pixels = 3078 bytes (well under ~4013 byte MTU)
+- 32x32 grayscale: 6 header + 1024 pixels = 1030 bytes
+- 64x64 RGB would be 12294 bytes — requires multi-frame reassembly (later)
+
+#### Pixel Generation (Pure Python, No Dependencies)
+
+No Pillow or image library. Pixel data is generated directly as bytes.
+
+HSV-to-RGB conversion in pure Python:
+- Hue = `(counter * 13 + x * 7 + y * 3) % 360`
+- Saturation = 0.85
+- Value = 0.5 + 0.5 * cos(x/w * π) * sin(y/h * π)
+- Output: 3 bytes per pixel (R, G, B), each 0-255
+
+This produces a colorful shifting gradient — visually distinct per counter,
+easy to verify the pipeline is working, and exercises the full RGB path.
+
+#### Config Shape
+
+Replace `message_template` in `[c2_uplink]` with image-specific fields:
+
+```ini
+[c2_uplink]
+enabled = true
+interval_ms = 1000
+destination_id = 1
+ttl = 2
+image_width = 32
+image_height = 32
+image_format = rgb
+image_style = gradient
+start_counter = 1
+```
+
+#### Changes by File
+
+**`mesh_txrx.py`**:
+- Replace `build_c2_uplink_payload()` with image frame generator
+- Build KOVA header + pixel bytes
+- Add CLI args: `--c2-uplink-image-width`, `--c2-uplink-image-height`,
+  `--c2-uplink-image-format`, `--c2-uplink-image-style`
+- Remove `--c2-uplink-message-template` (no longer needed)
+
+**`c2_http_server.py`**:
+- After decrypting, check if plaintext starts with `b"KOVA"`
+- If image: parse header, store pixel data as base64 with metadata
+  (`width`, `height`, `pixel_format`, `image_data_b64`)
+- If text: store as `payload_text` (backward compatible)
+- HTML render: image events use `<canvas>` with inline JS to draw raw pixels;
+  text events use `<code>` block (unchanged)
+- `/latest` API returns base64 image data + metadata for image payloads
+
+**`c2_gateway.py`**:
+- No changes needed — gateway is opaque to inner payload content
+
+#### Multi-Frame Reassembly (Future)
+
+For resolutions larger than the MTU allows (e.g. 64x64 RGB = 12294 bytes):
+- Split image into tile fragments, each fitting in one uplink
+- Fragment header: frame_id, tile_x, tile_y, tile_w, tile_h, total_tiles
+- C2 server buffers fragments and reassembles when all tiles arrive
+- Timeout/eviction for incomplete frames
+
+#### Forward Compatibility
+
+The KOVA magic + header design maps directly to how a real video codec would
+work later:
+- Replace pixel generation with encoded frame bytes (e.g. MJPEG, H.264 NAL)
+- Keep the same magic header for detection
+- Add a `codec` field when multiple codecs are supported
+
 ## Next Implementation Steps
 
 1. Re-test three nodes with `[mesh_crypto] enabled = true`, `stream_id =

@@ -4,6 +4,9 @@ Small demo layer for visualizing three transmitter "drones" and the base
 receiver. It runs in simulation mode by default and can also listen to real
 `wfb_rs` app-protocol frames.
 
+For a Linux VM + `uv` step-by-step setup/run guide, see
+[`LINUX_VM_UV_RUNBOOK.md`](./LINUX_VM_UV_RUNBOOK.md).
+
 ## Hardware Shape
 
 - The dashboard computer is the **base receiver node**.

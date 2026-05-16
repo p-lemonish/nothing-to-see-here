@@ -228,19 +228,20 @@ The Python example also has an optional v0 app protocol header for compact
 sender identity. Keep the same wifi channel and `stream_id` for the group; give
 each node a distinct `--sender-id`.
 
-Receiver:
+Peer A:
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py \
-  --iface "$RXNIC" --stream-id 1 --app-proto --sender-id 2
+  --iface "$NIC" --stream-id 1 --app-proto --sender-id 1 \
+  --message "hello from node 1" --message-type hello --count 0 --tx-interval-ms 1000
 ```
 
-Sender:
+Peer B:
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py \
-  --iface "$TXNIC" --stream-id 1 --app-proto --sender-id 1 \
-  --message "hello world" --message-type hello --count 0 --tx-interval-ms 1000
+  --iface "$NIC" --stream-id 1 --app-proto --sender-id 2 \
+  --message "hello from node 2" --message-type hello --count 0 --tx-interval-ms 1000
 ```
 
 TTL-limited mesh flooding uses the `route_data` wrapper. Run this on each relay

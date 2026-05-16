@@ -1,34 +1,53 @@
+# Full setup (uv + venv + bindings)
+
 ```bash
-sudo python/.venv/bin/python python/examples/mesh_txrx.py --config configs/node1.ini
-sudo python/.venv/bin/python python/examples/mesh_txrx.py --config configs/node2.ini
-sudo python/.venv/bin/python python/examples/mesh_txrx.py --config configs/node3.ini
+cd kova-wfb-rs
+
+# one-time: install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+
+# build the Rust shared library used by Python bindings
+cargo build --release
+
+# create and populate Python venv with uv
+cd python
+uv venv .venv
+source .venv/bin/activate
+uv pip install -e .
+cd ..
 ```
+
+# Start from here for runtime commands
+
 ```bash
 iw dev
-# take note of RX and TX NIC of wifi dongles
-export RXNIC=wlx5cffffaba18f # use your own..
-export TXNIC=wlx5cffffabb301 # use your own..
+# pick the monitor-capable NIC for this node
+export NIC=wlx5cffffaba18f # use your own
 ```
 
-Run this to get both ifaces into monitor mode and up (on ch36)
+Put the NIC into monitor mode on ch36:
 
 ```bash
-sudo nmcli dev set "$TXNIC" managed no
-sudo ip link set "$TXNIC" down
-sudo iw dev "$TXNIC" set type monitor
-sudo ip link set "$TXNIC" up
-sudo iw dev "$TXNIC" set channel 36 HT20
-sudo iw dev "$TXNIC" set power_save off
-
-sudo nmcli dev set "$RXNIC" managed no
-sudo ip link set "$RXNIC" down
-sudo iw dev "$RXNIC" set type monitor
-sudo ip link set "$RXNIC" up
-sudo iw dev "$RXNIC" set channel 36 HT20
-sudo iw dev "$RXNIC" set power_save off
+sudo nmcli dev set "$NIC" managed no
+sudo ip link set "$NIC" down
+sudo iw dev "$NIC" set type monitor
+sudo ip link set "$NIC" up
+sudo iw dev "$NIC" set channel 36 HT20
+sudo iw dev "$NIC" set power_save off
 ```
 
+Run one process per peer (same WiFi channel + stream id, different sender ids):
+
 ```bash
-sudo python/.venv/bin/python python/examples/simple_txrx.py --iface "$TXNIC" --stream-id 1 --app-proto --sender-id 42 --message "hello 67" --message-type hello --count 0 --tx-interval-ms 1000
-sudo python/.venv/bin/python python/examples/simple_txrx.py --iface "$RXNIC" --stream-id 1 --app-proto --sender-id 67 --message "hello 42" --message-type hello --count 0 --tx-interval-ms 1000
+sudo -E "$VIRTUAL_ENV/bin/python" python/examples/simple_txrx.py --iface "$NIC" --stream-id 1 --app-proto --sender-id 42 --message "hello 67" --message-type hello --count 0 --tx-interval-ms 1000
+sudo -E "$VIRTUAL_ENV/bin/python" python/examples/simple_txrx.py --iface "$NIC" --stream-id 1 --app-proto --sender-id 67 --message "hello 42" --message-type hello --count 0 --tx-interval-ms 1000
+```
+
+Optional: config-based mesh example:
+
+```bash
+sudo -E "$VIRTUAL_ENV/bin/python" python/examples/mesh_txrx.py --config configs/node1.ini
+sudo -E "$VIRTUAL_ENV/bin/python" python/examples/mesh_txrx.py --config configs/node2.ini
+sudo -E "$VIRTUAL_ENV/bin/python" python/examples/mesh_txrx.py --config configs/node3.ini
 ```

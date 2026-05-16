@@ -113,20 +113,21 @@ frames during debugging.
 Use two dongles on the same PC or two hosts. Both must be in monitor mode on the
 same wifi channel and use the same `stream_id`.
 
-Receiver:
+Peer A:
 
 ```bash
-export RXNIC=wlx5cffffaba18f
+export NIC=wlx5cffffaba18f
 sudo python/.venv/bin/python python/examples/simple_txrx.py \
-  --iface "$RXNIC" --stream-id 1 --app-proto --sender-id 67
+  --iface "$NIC" --stream-id 1 --app-proto --sender-id 67 \
+  --message "hello 42" --message-type hello --count 0 --tx-interval-ms 1000
 ```
 
-Sender:
+Peer B:
 
 ```bash
-export TXNIC=wlxfc221c2004ce
+export NIC=wlxfc221c2004ce
 sudo python/.venv/bin/python python/examples/simple_txrx.py \
-  --iface "$TXNIC" --stream-id 1 --app-proto --sender-id 42 \
+  --iface "$NIC" --stream-id 1 --app-proto --sender-id 42 \
   --message "hello 67" --message-type hello --count 0 --tx-interval-ms 1000
 ```
 

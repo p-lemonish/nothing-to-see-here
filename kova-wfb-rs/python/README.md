@@ -66,19 +66,20 @@ To include the v0 app header with a compact sender id, use app protocol mode.
 All peers that should hear each other still use the same `stream_id`; each node
 gets its own `--sender-id`.
 
-Receiver:
+Peer A:
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py \
-  --iface "$RXNIC" --stream-id 1 --app-proto --sender-id 2
+  --iface "$NIC" --stream-id 1 --app-proto --sender-id 1 \
+  --message "hello from node 1" --message-type hello --count 0 --tx-interval-ms 1000
 ```
 
-Sender:
+Peer B:
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py \
-  --iface "$TXNIC" --stream-id 1 --app-proto --sender-id 1 \
-  --message "hello world" --message-type hello --count 0 --tx-interval-ms 1000
+  --iface "$NIC" --stream-id 1 --app-proto --sender-id 2 \
+  --message "hello from node 2" --message-type hello --count 0 --tx-interval-ms 1000
 ```
 
 TTL-limited mesh flooding uses the `route_data` wrapper. Run this on each relay

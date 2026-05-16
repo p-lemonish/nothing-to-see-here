@@ -145,6 +145,10 @@ frames during debugging.
 - `app_proto.py` contains secure wrapper v1 helpers for ChaCha20-Poly1305 with
   `secure_version`, `security_domain`, `key_id`, `key_epoch`, `nonce`, and
   `ciphertext_and_tag`.
+- `app_proto.py` now includes structured `status` payload helpers and validation
+  (`status_version`, `uptime_s`, `battery_pct`, `peer_count`, `flags`).
+- `python/tests/test_app_proto.py` covers status payload edge cases and secure
+  status round-trips/authentication failure behavior.
 - `python/examples/mesh_txrx.py` supports Phase A mesh-group crypto for
   non-`sync` routed payloads when `[mesh_crypto] enabled = true`.
 - Mesh crypto is controlled by config only; there is no runtime CLI override for
@@ -360,7 +364,7 @@ but they should not be the default mesh mode.
 
 The mesh transport now works at a simple UDP-like level. The next phase is
 confidentiality, authenticity, and compromise containment. Compression and
-structured status can wait.
+additional status fields can wait.
 
 The key design shift:
 
@@ -943,8 +947,9 @@ Rules:
 
 ### 17. Structured Status Payload
 
-Replace free-text status messages with a small binary status payload once secure
-transport is stable.
+The binary status payload format is now implemented at the protocol codec level.
+This gives a stable payload contract for status data regardless of transport
+mode.
 
 V1 status payload:
 
@@ -972,6 +977,11 @@ Later status fields:
 - RSSI summaries
 - retry/loss estimates
 - GPS/position if available
+
+Remaining integration work:
+
+- Ensure runtime status producers in examples use this binary payload
+  consistently where status is transmitted.
 
 ### 18. Channel Agility Hardening
 

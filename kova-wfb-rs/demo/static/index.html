@@ -255,7 +255,46 @@
         border-left: 1px solid var(--line);
         background: var(--panel);
         display: grid;
-        grid-template-rows: auto auto 1fr;
+        grid-template-rows: auto 1fr;
+      }
+
+      .sidebar-tabs {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 6px;
+        padding: 10px;
+        border-bottom: 1px solid var(--line);
+        background: #fff;
+      }
+
+      .sidebar-tab {
+        min-height: 36px;
+        border: 1px solid var(--line);
+        background: var(--panel-soft);
+        color: var(--ink);
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      .sidebar-tab[aria-selected="true"] {
+        border-color: var(--ink);
+        background: var(--ink);
+        color: #fff;
+      }
+
+      .sidebar-tab:focus-visible {
+        outline: 2px solid var(--radio);
+        outline-offset: 2px;
+      }
+
+      .sidebar-page {
+        min-height: 0;
+        overflow: auto;
+      }
+
+      .sidebar-page[hidden] {
+        display: none;
       }
 
       .panel-section {
@@ -362,6 +401,7 @@
       .events {
         min-height: 0;
         overflow: auto;
+        border-bottom: 0;
       }
 
       .event-list {
@@ -492,26 +532,38 @@
           <svg id="meshSvg" viewBox="0 0 1000 680" role="img" aria-label="Drone mesh map"></svg>
         </section>
         <aside>
-          <section class="panel-section">
-            <div class="section-head">
-              <h2>Jamming</h2>
-              <button class="reset-btn" id="resetJam">Clear</button>
-            </div>
-            <div class="toggles" id="jamToggles"></div>
-          </section>
-          <section class="panel-section">
-            <div class="section-head">
-              <h2>Transmitters</h2>
-              <span class="badge" id="sourceBadge">source</span>
-            </div>
-            <div class="node-list" id="nodeList"></div>
-          </section>
-          <section class="panel-section events">
-            <div class="section-head">
-              <h2>Received Data</h2>
-            </div>
-            <div class="event-list" id="eventList"></div>
-          </section>
+          <div class="sidebar-tabs" role="tablist" aria-label="Sidebar pages">
+            <button class="sidebar-tab" id="tab-nodes" role="tab" aria-selected="true" aria-controls="page-nodes" data-page="nodes">
+              Nodes
+            </button>
+            <button class="sidebar-tab" id="tab-data" role="tab" aria-selected="false" aria-controls="page-data" data-page="data" tabindex="-1">
+              Data
+            </button>
+          </div>
+          <div class="sidebar-page" id="page-nodes" role="tabpanel" aria-labelledby="tab-nodes" data-page="nodes">
+            <section class="panel-section">
+              <div class="section-head">
+                <h2>Jamming</h2>
+                <button class="reset-btn" id="resetJam">Clear</button>
+              </div>
+              <div class="toggles" id="jamToggles"></div>
+            </section>
+            <section class="panel-section">
+              <div class="section-head">
+                <h2>Transmitters</h2>
+                <span class="badge" id="sourceBadge">source</span>
+              </div>
+              <div class="node-list" id="nodeList"></div>
+            </section>
+          </div>
+          <div class="sidebar-page" id="page-data" role="tabpanel" aria-labelledby="tab-data" data-page="data" hidden>
+            <section class="panel-section events">
+              <div class="section-head">
+                <h2>Received Data</h2>
+              </div>
+              <div class="event-list" id="eventList"></div>
+            </section>
+          </div>
         </aside>
       </main>
     </div>
@@ -529,8 +581,22 @@
       const uptime = document.getElementById("uptime");
       const sourceBadge = document.getElementById("sourceBadge");
       const resetJam = document.getElementById("resetJam");
+      const sidebarTabs = document.querySelectorAll(".sidebar-tab");
+      const sidebarPages = document.querySelectorAll(".sidebar-page");
 
       let latest = null;
+
+      function setSidebarPage(page) {
+        for (const tab of sidebarTabs) {
+          const isSelected = tab.dataset.page === page;
+          tab.setAttribute("aria-selected", String(isSelected));
+          tab.tabIndex = isSelected ? 0 : -1;
+        }
+
+        for (const panel of sidebarPages) {
+          panel.hidden = panel.dataset.page !== page;
+        }
+      }
 
       function fmtAge(ms) {
         if (ms === null || ms === undefined) return "never";
@@ -703,6 +769,17 @@
           .replaceAll(">", "&gt;")
           .replaceAll('"', "&quot;")
           .replaceAll("'", "&#039;");
+      }
+
+      for (const tab of sidebarTabs) {
+        tab.addEventListener("click", () => setSidebarPage(tab.dataset.page));
+        tab.addEventListener("keydown", (event) => {
+          if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+          event.preventDefault();
+          const nextPage = tab.dataset.page === "nodes" ? "data" : "nodes";
+          setSidebarPage(nextPage);
+          document.querySelector(`.sidebar-tab[data-page="${nextPage}"]`)?.focus();
+        });
       }
 
       resetJam.addEventListener("click", clearJamming);

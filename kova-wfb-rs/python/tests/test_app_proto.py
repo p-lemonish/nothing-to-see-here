@@ -1,16 +1,23 @@
 import pytest
 
 from wfb_rs_py.app_proto import (
+    ADDR_C2,
+    ADDR_NODE,
     AppFrameError,
     CHACHA20_POLY1305_TAG_SIZE,
     HEADER_SIZE,
+    MSG_DATA,
     MSG_HELLO,
     MSG_ROUTE_DATA,
+    MSG_ROUTE_V2,
     MSG_STATUS,
     MSG_SYNC,
     ROUTE_SECURE_ASSOCIATED_DATA_SIZE,
+    ROUTE_V2_E2E_ASSOCIATED_DATA_SIZE,
+    ROUTE_V2_PAYLOAD_SIZE,
     SECURE_PAYLOAD_SIZE,
     SEC_DOMAIN_MESH_GROUP,
+    SEC_DOMAIN_NODE_TO_C2,
     STATUS_BATTERY_UNKNOWN,
     STATUS_FLAG_CRYPTO_ENABLED,
     STATUS_FLAG_DEGRADED_LINK,
@@ -20,15 +27,21 @@ from wfb_rs_py.app_proto import (
     STATUS_VERSION,
     SYNC_PAYLOAD_SIZE,
     ROUTE_DATA_PAYLOAD_SIZE,
+    TRAFFIC_C2_UPLINK,
     VERSION,
+    address_type_name,
+    address_type_value,
     decode_frame,
     decode_route_data_payload,
+    decode_route_v2_payload,
     decode_secure_payload,
     decode_status_payload,
     decode_sync_payload,
     decrypt_secure_payload,
     encode_frame,
     encode_route_data_payload,
+    encode_route_v2_e2e_associated_data,
+    encode_route_v2_payload,
     encode_route_secure_associated_data,
     encode_secure_payload,
     encode_status_payload,
@@ -37,6 +50,8 @@ from wfb_rs_py.app_proto import (
     message_type_value,
     security_domain_name,
     security_domain_value,
+    traffic_class_name,
+    traffic_class_value,
 )
 
 
@@ -240,6 +255,82 @@ def test_route_data_cannot_nest_route_data():
 def test_route_data_message_type_is_known():
     assert message_type_value("route_data") == MSG_ROUTE_DATA
     assert message_type_name(MSG_ROUTE_DATA) == "route_data"
+
+
+def test_encode_decode_route_v2_payload():
+    encoded = encode_route_v2_payload(
+        origin_type="node",
+        origin_id=42,
+        destination_type="c2",
+        destination_id=1,
+        ttl=3,
+        origin_seq=500,
+        traffic_class="c2_uplink",
+        inner_type="data",
+        inner_payload=b"opaque",
+    )
+
+    route = decode_route_v2_payload(encoded)
+
+    assert len(encoded) == ROUTE_V2_PAYLOAD_SIZE + len(b"opaque")
+    assert route.origin_type == ADDR_NODE
+    assert route.origin_id == 42
+    assert route.destination_type == ADDR_C2
+    assert route.destination_id == 1
+    assert route.ttl == 3
+    assert route.origin_seq == 500
+    assert route.traffic_class == TRAFFIC_C2_UPLINK
+    assert route.traffic_class_name == "c2_uplink"
+    assert route.inner_type == MSG_DATA
+    assert route.inner_payload == b"opaque"
+    assert route.dedupe_key == (ADDR_NODE, 42, 500)
+
+
+def test_route_v2_ttl_decrement_keeps_opaque_payload():
+    route = decode_route_v2_payload(
+        encode_route_v2_payload(
+            origin_type="node",
+            origin_id=42,
+            destination_type="c2",
+            destination_id=1,
+            ttl=2,
+            origin_seq=10,
+            traffic_class="c2_uplink",
+            inner_type="data",
+            inner_payload=b"ciphertext",
+        )
+    )
+
+    forwarded = route.decremented_ttl()
+
+    assert forwarded.ttl == 1
+    assert forwarded.origin_type == route.origin_type
+    assert forwarded.origin_id == route.origin_id
+    assert forwarded.destination_type == route.destination_type
+    assert forwarded.destination_id == route.destination_id
+    assert forwarded.origin_seq == route.origin_seq
+    assert forwarded.traffic_class == route.traffic_class
+    assert forwarded.inner_payload == b"ciphertext"
+
+
+def test_route_v2_rejects_broadcast_origin():
+    with pytest.raises(AppFrameError, match="origin_type broadcast"):
+        encode_route_v2_payload(
+            origin_type="broadcast",
+            origin_id=0,
+            destination_type="c2",
+            destination_id=1,
+            ttl=1,
+            origin_seq=1,
+            traffic_class="c2_uplink",
+            inner_type="data",
+            inner_payload=b"",
+        )
+
+
+def test_route_v2_message_type_is_known():
+    assert message_type_value("route_v2") == MSG_ROUTE_V2
+    assert message_type_name(MSG_ROUTE_V2) == "route_v2"
 
 
 def test_encode_decode_sync_payload():
@@ -478,6 +569,89 @@ def test_secure_status_rejects_tampered_route_associated_data():
         decrypt_secure_payload(secure, key=key, associated_data=tampered_aad)
 
 
+def test_node_to_c2_e2e_roundtrip_ignores_mutable_ttl():
+    key = bytes(range(32))
+    nonce = bytes(range(12))
+    plaintext = b"node 42 report"
+    aad = encode_route_v2_e2e_associated_data(
+        origin_type="node",
+        origin_id=42,
+        destination_type="c2",
+        destination_id=1,
+        origin_seq=700,
+        traffic_class="c2_uplink",
+        inner_type="data",
+        inner_plaintext_len=len(plaintext),
+    )
+
+    secure_payload = encode_secure_payload(
+        key=key,
+        security_domain="node_to_c2",
+        key_id=4201,
+        key_epoch=7,
+        plaintext=plaintext,
+        associated_data=aad,
+        nonce=nonce,
+    )
+    route = decode_route_v2_payload(
+        encode_route_v2_payload(
+            origin_type="node",
+            origin_id=42,
+            destination_type="c2",
+            destination_id=1,
+            ttl=2,
+            origin_seq=700,
+            traffic_class="c2_uplink",
+            inner_type="data",
+            inner_payload=secure_payload,
+        )
+    )
+    forwarded = route.decremented_ttl()
+    secure = decode_secure_payload(forwarded.inner_payload)
+
+    assert len(aad) == ROUTE_V2_E2E_ASSOCIATED_DATA_SIZE
+    assert secure.security_domain == SEC_DOMAIN_NODE_TO_C2
+    assert decrypt_secure_payload(secure, key=key, associated_data=aad) == plaintext
+
+
+def test_node_to_c2_e2e_rejects_redirected_destination():
+    key = bytes(range(32))
+    plaintext = b"node 42 report"
+    aad = encode_route_v2_e2e_associated_data(
+        origin_type="node",
+        origin_id=42,
+        destination_type="c2",
+        destination_id=1,
+        origin_seq=700,
+        traffic_class="c2_uplink",
+        inner_type="data",
+        inner_plaintext_len=len(plaintext),
+    )
+    redirected_aad = encode_route_v2_e2e_associated_data(
+        origin_type="node",
+        origin_id=42,
+        destination_type="c2",
+        destination_id=2,
+        origin_seq=700,
+        traffic_class="c2_uplink",
+        inner_type="data",
+        inner_plaintext_len=len(plaintext),
+    )
+    encoded = encode_secure_payload(
+        key=key,
+        security_domain="node_to_c2",
+        key_id=4201,
+        key_epoch=7,
+        plaintext=plaintext,
+        associated_data=aad,
+        nonce=bytes(range(12)),
+    )
+    secure = decode_secure_payload(encoded)
+
+    with pytest.raises(AppFrameError, match="authentication failed"):
+        decrypt_secure_payload(secure, key=key, associated_data=redirected_aad)
+
+
 def test_secure_payload_rejects_short_wrapper():
     with pytest.raises(AppFrameError, match="secure payload too short"):
         decode_secure_payload(b"x" * (SECURE_PAYLOAD_SIZE + CHACHA20_POLY1305_TAG_SIZE - 1))
@@ -488,3 +662,10 @@ def test_security_domain_value_and_name():
     assert security_domain_value("0x01") == SEC_DOMAIN_MESH_GROUP
     assert security_domain_name(SEC_DOMAIN_MESH_GROUP) == "mesh_group"
     assert security_domain_name(0x99) == "0x99"
+
+
+def test_address_type_and_traffic_class_value_and_name():
+    assert address_type_value("node") == ADDR_NODE
+    assert address_type_name(ADDR_C2) == "c2"
+    assert traffic_class_value("c2_uplink") == TRAFFIC_C2_UPLINK
+    assert traffic_class_name(TRAFFIC_C2_UPLINK) == "c2_uplink"

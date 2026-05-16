@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import json
 import os
 import secrets
 import struct
 import subprocess
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,23 +19,39 @@ from typing import Deque
 
 from wfb_rs_py import Rx, Tx
 from wfb_rs_py.app_proto import (
+    ADDR_BROADCAST,
+    ADDR_C2,
+    ADDR_NODE,
     AppFrameError,
     CHACHA20_POLY1305_KEY_SIZE,
     MSG_ROUTE_DATA,
+    MSG_ROUTE_V2,
     MSG_SYNC,
+    SEC_DOMAIN_C2_TO_NODE,
     SEC_DOMAIN_MESH_GROUP,
+    SEC_DOMAIN_NODE_TO_C2,
+    TRAFFIC_C2_DOWNLINK,
+    TRAFFIC_C2_UPLINK,
+    TRAFFIC_MESH,
+    address_type_name,
+    address_type_value,
     decode_frame,
     decode_route_data_payload,
+    decode_route_v2_payload,
     decode_secure_payload,
     decode_sync_payload,
     decrypt_secure_payload,
     encode_frame,
     encode_route_data_payload,
+    encode_route_v2_e2e_associated_data,
+    encode_route_v2_payload,
     encode_secure_payload,
     encode_sync_payload,
     message_type_value,
     security_domain_name,
     security_domain_value,
+    traffic_class_name,
+    traffic_class_value,
 )
 
 MAX_U16 = 0xFFFF
@@ -39,7 +59,10 @@ MAX_U32 = 0xFFFF_FFFF
 DEFAULT_STREAM_ID = 0xDEAD_BEEF
 CONFIG_SECTION = "mesh"
 MESH_CRYPTO_SECTION = "mesh_crypto"
+C2_UPLINK_CRYPTO_SECTION = "c2_uplink_crypto"
+C2_DOWNLINK_CRYPTO_SECTION = "c2_downlink_crypto"
 SECURE_ROUTE_AAD = struct.Struct("!4sBBBIBH")
+DEFAULT_C2_ID = 1
 
 
 @dataclass(frozen=True)
@@ -53,6 +76,14 @@ class ScheduleState:
 
 @dataclass(frozen=True)
 class MeshCryptoConfig:
+    security_domain: int
+    key_id: int
+    key_epoch: int
+    key: bytes
+
+
+@dataclass(frozen=True)
+class E2ECryptoConfig:
     security_domain: int
     key_id: int
     key_epoch: int
@@ -92,14 +123,14 @@ def _parse_channel_list(value: object | None) -> list[int]:
     return channels
 
 
-def _parse_key_hex(value: str) -> bytes:
+def _parse_key_hex(value: str, *, section_name: str) -> bytes:
     try:
         key = bytes.fromhex(value.strip())
     except ValueError as exc:
-        raise ValueError("mesh_crypto key_hex must be valid hex") from exc
+        raise ValueError(f"{section_name} key_hex must be valid hex") from exc
     if len(key) != CHACHA20_POLY1305_KEY_SIZE:
         raise ValueError(
-            "mesh_crypto key_hex must decode to "
+            f"{section_name} key_hex must decode to "
             f"{CHACHA20_POLY1305_KEY_SIZE} bytes, got {len(key)}"
         )
     return key
@@ -125,6 +156,49 @@ def _secure_route_aad(
         inner_type,
         plaintext_len,
     )
+
+
+def _route_v2_e2e_aad(
+    *,
+    origin_type: int,
+    origin_id: int,
+    destination_type: int,
+    destination_id: int,
+    origin_seq: int,
+    traffic_class: int,
+    inner_type: int,
+    plaintext_len: int,
+) -> bytes:
+    return encode_route_v2_e2e_associated_data(
+        origin_type=origin_type,
+        origin_id=origin_id,
+        destination_type=destination_type,
+        destination_id=destination_id,
+        origin_seq=origin_seq,
+        traffic_class=traffic_class,
+        inner_type=inner_type,
+        inner_plaintext_len=plaintext_len,
+    )
+
+
+def _addr_label(address_type: int, address_id: int) -> str:
+    if address_type == ADDR_BROADCAST:
+        return "broadcast"
+    return f"{address_type_name(address_type)}:{address_id}"
+
+
+def _normalize_ingest_url(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    parsed = urllib.parse.urlparse(text)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError("C2 HTTP forward URL must include scheme and host")
+    if parsed.path in {"", "/"}:
+        parsed = parsed._replace(path="/ingest")
+    return urllib.parse.urlunparse(parsed)
 
 
 def _utc_ms() -> int:
@@ -237,6 +311,10 @@ def _load_config(path: str | None) -> dict[str, object]:
     out: dict[str, object] = {}
     for key in (
         "iface",
+        "origin_type",
+        "destination_type",
+        "traffic_class",
+        "c2_http_forward_url",
         "message_type",
         "message",
         "hop_channels",
@@ -250,6 +328,7 @@ def _load_config(path: str | None) -> dict[str, object]:
     for key in (
         "stream_id",
         "sender_id",
+        "c2_id",
         "destination_id",
         "ttl",
         "count",
@@ -288,16 +367,54 @@ def _load_config(path: str | None) -> dict[str, object]:
             if key in section:
                 out[f"mesh_crypto_{key}"] = int(section[key], 0)
 
+    for section_name, prefix in (
+        (C2_UPLINK_CRYPTO_SECTION, "c2_uplink_crypto"),
+        (C2_DOWNLINK_CRYPTO_SECTION, "c2_downlink_crypto"),
+    ):
+        if parser.has_section(section_name):
+            section = parser[section_name]
+            if "enabled" in section:
+                out[f"{prefix}_enabled"] = section.getboolean("enabled")
+            for key in ("security_domain", "key_hex"):
+                if key in section:
+                    value = _optional_text(section.get(key))
+                    if value is not None:
+                        out[f"{prefix}_{key}"] = value
+            for key in ("key_id", "key_epoch", "replay_window"):
+                if key in section:
+                    out[f"{prefix}_{key}"] = int(section[key], 0)
+
+    for section_name, prefix in (
+        ("c2_uplink_key.", "c2_uplink_crypto_extra_keys"),
+        ("c2_downlink_key.", "c2_downlink_crypto_extra_keys"),
+    ):
+        for parser_section_name in parser.sections():
+            if not parser_section_name.startswith(section_name):
+                continue
+            section = parser[parser_section_name]
+            if "enabled" in section and not section.getboolean("enabled"):
+                continue
+            key_spec: dict[str, object] = {"section_name": parser_section_name}
+            for key in ("security_domain", "key_hex"):
+                if key in section:
+                    value = _optional_text(section.get(key))
+                    if value is not None:
+                        key_spec[key] = value
+            for key in ("key_id", "key_epoch"):
+                if key in section:
+                    key_spec[key] = int(section[key], 0)
+            out.setdefault(prefix, []).append(key_spec)
+
     return out
 
 
 class SeenRoutes:
     def __init__(self, limit: int):
         self._limit = limit
-        self._seen: set[tuple[int, int]] = set()
-        self._order: Deque[tuple[int, int]] = deque()
+        self._seen: set[tuple[int, ...]] = set()
+        self._order: Deque[tuple[int, ...]] = deque()
 
-    def remember(self, key: tuple[int, int]) -> bool:
+    def remember(self, key: tuple[int, ...]) -> bool:
         if key in self._seen:
             return False
 
@@ -308,17 +425,17 @@ class SeenRoutes:
             self._seen.discard(old)
         return True
 
-    def contains(self, key: tuple[int, int]) -> bool:
+    def contains(self, key: tuple[int, ...]) -> bool:
         return key in self._seen
 
 
 class ReplayWindow:
     def __init__(self, limit: int):
         self._limit = limit
-        self._seen: set[tuple[int, int, int, int]] = set()
-        self._order: Deque[tuple[int, int, int, int]] = deque()
+        self._seen: set[tuple[int, ...]] = set()
+        self._order: Deque[tuple[int, ...]] = deque()
 
-    def remember(self, key: tuple[int, int, int, int]) -> bool:
+    def remember(self, key: tuple[int, ...]) -> bool:
         if key in self._seen:
             return False
 
@@ -339,6 +456,20 @@ def _encode_outer_route_frame(
     return encode_frame(
         sender_id=sender_id,
         message_type=MSG_ROUTE_DATA,
+        app_seq=app_seq,
+        payload=route_payload,
+    )
+
+
+def _encode_outer_route_v2_frame(
+    *,
+    sender_id: int,
+    app_seq: int,
+    route_payload: bytes,
+) -> bytes:
+    return encode_frame(
+        sender_id=sender_id,
+        message_type=MSG_ROUTE_V2,
         app_seq=app_seq,
         payload=route_payload,
     )
@@ -374,10 +505,36 @@ def main() -> int:
         help="local sender id (default: $WFB_SENDER_ID or $SENDER_ID)",
     )
     parser.add_argument(
+        "--origin-type",
+        default=config_defaults.get("origin_type"),
+        help="typed route origin type for route_v2: node or c2",
+    )
+    parser.add_argument(
+        "--destination-type",
+        default=config_defaults.get("destination_type"),
+        help="typed route destination type: broadcast, node, or c2",
+    )
+    parser.add_argument(
+        "--traffic-class",
+        default=config_defaults.get("traffic_class", "mesh"),
+        help="traffic class: mesh, c2_uplink, or c2_downlink",
+    )
+    parser.add_argument(
+        "--c2-id",
+        type=lambda value: int(value, 0),
+        default=config_defaults.get("c2_id", DEFAULT_C2_ID),
+        help="default C2 id used when traffic_class=c2_uplink",
+    )
+    parser.add_argument(
+        "--c2-http-forward-url",
+        default=config_defaults.get("c2_http_forward_url"),
+        help="optional C2 /ingest URL for forwarding opaque c2_uplink route_v2 packets",
+    )
+    parser.add_argument(
         "--destination-id",
         type=lambda value: int(value, 0),
         default=config_defaults.get("destination_id", 0),
-        help="target node id; 0 broadcasts to all nodes",
+        help="target id; for legacy mesh, 0 broadcasts to all nodes",
     )
     parser.add_argument(
         "--ttl",
@@ -494,10 +651,59 @@ def main() -> int:
         parser.error("--sender-id is required unless WFB_SENDER_ID or SENDER_ID is set")
     if not 1 <= args.sender_id <= 255:
         parser.error("--sender-id must be in range 1..255")
+    if not 1 <= args.c2_id <= 255:
+        parser.error("--c2-id must be in range 1..255")
     if not 0 <= args.destination_id <= 255:
         parser.error("--destination-id must be in range 0..255")
     if not 0 <= args.ttl <= 255:
         parser.error("--ttl must be in range 0..255")
+
+    try:
+        traffic_class = traffic_class_value(args.traffic_class)
+    except AppFrameError as exc:
+        parser.error(str(exc))
+
+    origin_type_default = (
+        "c2" if traffic_class == TRAFFIC_C2_DOWNLINK else "node"
+    )
+    try:
+        origin_type = address_type_value(args.origin_type or origin_type_default)
+    except AppFrameError as exc:
+        parser.error(str(exc))
+    if origin_type == ADDR_BROADCAST:
+        parser.error("--origin-type cannot be broadcast")
+
+    destination_id = args.destination_id
+    destination_type_default: str
+    if traffic_class == TRAFFIC_C2_UPLINK:
+        destination_type_default = "c2"
+        if destination_id == 0:
+            destination_id = args.c2_id
+    elif traffic_class == TRAFFIC_C2_DOWNLINK:
+        destination_type_default = "node"
+    else:
+        destination_type_default = "broadcast" if destination_id == 0 else "node"
+    try:
+        destination_type = address_type_value(
+            args.destination_type or destination_type_default
+        )
+    except AppFrameError as exc:
+        parser.error(str(exc))
+    if destination_type == ADDR_BROADCAST and destination_id != 0:
+        parser.error("broadcast destination_id must be 0")
+    if destination_type != ADDR_BROADCAST and destination_id == 0:
+        parser.error("non-broadcast destination_id must be non-zero")
+    if traffic_class == TRAFFIC_C2_UPLINK and destination_type != ADDR_C2:
+        parser.error("traffic_class=c2_uplink requires destination_type=c2")
+    if traffic_class == TRAFFIC_C2_DOWNLINK and destination_type != ADDR_NODE:
+        parser.error("traffic_class=c2_downlink requires destination_type=node")
+    use_route_v2 = traffic_class != TRAFFIC_MESH
+    args.destination_id = destination_id
+    try:
+        args.c2_http_forward_url = _normalize_ingest_url(args.c2_http_forward_url)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     if args.count < 0:
         parser.error("--count must be >= 0")
     if args.tx_interval_ms < 0:
@@ -525,8 +731,8 @@ def main() -> int:
         inner_type = message_type_value(args.message_type)
     except AppFrameError as exc:
         parser.error(str(exc))
-    if inner_type == MSG_ROUTE_DATA:
-        parser.error("--message-type cannot be route_data")
+    if inner_type in {MSG_ROUTE_DATA, MSG_ROUTE_V2}:
+        parser.error("--message-type cannot be a route packet type")
     if inner_type == MSG_SYNC:
         parser.error("--message-type sync is reserved for --sync-heartbeat")
 
@@ -552,7 +758,10 @@ def main() -> int:
         if not key_hex:
             parser.error("[mesh_crypto] key_hex is required when enabled=true")
         try:
-            mesh_key = _parse_key_hex(str(key_hex))
+            mesh_key = _parse_key_hex(
+                str(key_hex),
+                section_name="[mesh_crypto]",
+            )
         except ValueError as exc:
             parser.error(str(exc))
         mesh_crypto = MeshCryptoConfig(
@@ -561,6 +770,129 @@ def main() -> int:
             key_epoch=key_epoch,
             key=mesh_key,
         )
+
+    def load_e2e_crypto(
+        *,
+        prefix: str,
+        section_name: str,
+        default_domain: int,
+    ) -> E2ECryptoConfig | None:
+        enabled = bool(config_defaults.get(f"{prefix}_enabled", False))
+        if not enabled:
+            return None
+        domain = security_domain_value(
+            config_defaults.get(
+                f"{prefix}_security_domain",
+                security_domain_name(default_domain),
+            )
+        )
+        if domain != default_domain:
+            parser.error(
+                f"{section_name} security_domain must be "
+                f"{security_domain_name(default_domain)}"
+            )
+        key_id = int(config_defaults.get(f"{prefix}_key_id", 0))
+        key_epoch = int(config_defaults.get(f"{prefix}_key_epoch", 0))
+        key_hex = config_defaults.get(f"{prefix}_key_hex")
+        if not 1 <= key_id <= MAX_U16:
+            parser.error(f"{section_name} key_id must be in range 1..65535")
+        if not 0 <= key_epoch <= MAX_U32:
+            parser.error(f"{section_name} key_epoch must fit in u32")
+        if not key_hex:
+            parser.error(f"{section_name} key_hex is required when enabled=true")
+        try:
+            key = _parse_key_hex(str(key_hex), section_name=section_name)
+        except ValueError as exc:
+            parser.error(str(exc))
+        return E2ECryptoConfig(
+            security_domain=domain,
+            key_id=key_id,
+            key_epoch=key_epoch,
+            key=key,
+        )
+
+    def load_e2e_crypto_spec(
+        *,
+        spec: dict[str, object],
+        default_domain: int,
+    ) -> E2ECryptoConfig:
+        section_name = str(spec.get("section_name", "[e2e_key]"))
+        domain = security_domain_value(
+            spec.get("security_domain", security_domain_name(default_domain))
+        )
+        if domain != default_domain:
+            parser.error(
+                f"{section_name} security_domain must be "
+                f"{security_domain_name(default_domain)}"
+            )
+        key_id = int(spec.get("key_id", 0))
+        key_epoch = int(spec.get("key_epoch", 0))
+        key_hex = spec.get("key_hex")
+        if not 1 <= key_id <= MAX_U16:
+            parser.error(f"{section_name} key_id must be in range 1..65535")
+        if not 0 <= key_epoch <= MAX_U32:
+            parser.error(f"{section_name} key_epoch must fit in u32")
+        if not key_hex:
+            parser.error(f"{section_name} key_hex is required")
+        try:
+            key = _parse_key_hex(str(key_hex), section_name=section_name)
+        except ValueError as exc:
+            parser.error(str(exc))
+        return E2ECryptoConfig(
+            security_domain=domain,
+            key_id=key_id,
+            key_epoch=key_epoch,
+            key=key,
+        )
+
+    c2_uplink_crypto = load_e2e_crypto(
+        prefix="c2_uplink_crypto",
+        section_name="[c2_uplink_crypto]",
+        default_domain=SEC_DOMAIN_NODE_TO_C2,
+    )
+    c2_downlink_crypto = load_e2e_crypto(
+        prefix="c2_downlink_crypto",
+        section_name="[c2_downlink_crypto]",
+        default_domain=SEC_DOMAIN_C2_TO_NODE,
+    )
+    c2_uplink_keyring: dict[tuple[int, int, int], E2ECryptoConfig] = {}
+    c2_downlink_keyring: dict[tuple[int, int, int], E2ECryptoConfig] = {}
+
+    def add_key(
+        keyring: dict[tuple[int, int, int], E2ECryptoConfig],
+        crypto: E2ECryptoConfig | None,
+    ) -> None:
+        if crypto is None:
+            return
+        keyring[(crypto.security_domain, crypto.key_id, crypto.key_epoch)] = crypto
+
+    add_key(c2_uplink_keyring, c2_uplink_crypto)
+    add_key(c2_downlink_keyring, c2_downlink_crypto)
+    for spec in config_defaults.get("c2_uplink_crypto_extra_keys", []):
+        add_key(
+            c2_uplink_keyring,
+            load_e2e_crypto_spec(
+                spec=spec,
+                default_domain=SEC_DOMAIN_NODE_TO_C2,
+            ),
+        )
+    for spec in config_defaults.get("c2_downlink_crypto_extra_keys", []):
+        add_key(
+            c2_downlink_keyring,
+            load_e2e_crypto_spec(
+                spec=spec,
+                default_domain=SEC_DOMAIN_C2_TO_NODE,
+            ),
+        )
+    if args.message is not None:
+        if traffic_class == TRAFFIC_C2_UPLINK and c2_uplink_crypto is None:
+            parser.error(
+                "traffic_class=c2_uplink requires [c2_uplink_crypto] enabled=true"
+            )
+        if traffic_class == TRAFFIC_C2_DOWNLINK and c2_downlink_crypto is None:
+            parser.error(
+                "traffic_class=c2_downlink requires [c2_downlink_crypto] enabled=true"
+            )
 
     seen = SeenRoutes(args.seen_limit)
     secure_replay = ReplayWindow(mesh_replay_window)
@@ -680,6 +1012,172 @@ def main() -> int:
             raise AppFrameError("secure replay detected")
         return plaintext, True
 
+    def e2e_crypto_for_outbound(route_traffic_class: int) -> E2ECryptoConfig | None:
+        if route_traffic_class == TRAFFIC_C2_UPLINK:
+            return c2_uplink_crypto
+        if route_traffic_class == TRAFFIC_C2_DOWNLINK:
+            return c2_downlink_crypto
+        return None
+
+    def e2e_crypto_for_inbound(route, secure) -> E2ECryptoConfig | None:
+        key_id = (secure.security_domain, secure.key_id, secure.key_epoch)
+        if route.traffic_class == TRAFFIC_C2_UPLINK:
+            if route.destination_type == ADDR_C2 and origin_type == ADDR_C2:
+                return c2_uplink_keyring.get(key_id)
+            return None
+        if route.traffic_class == TRAFFIC_C2_DOWNLINK:
+            if route.destination_type == ADDR_NODE and origin_type == ADDR_NODE:
+                return c2_downlink_keyring.get(key_id)
+            return None
+        return None
+
+    def validate_secure_key(
+        *,
+        secure,
+        crypto: E2ECryptoConfig,
+    ) -> None:
+        if secure.security_domain != crypto.security_domain:
+            raise AppFrameError(
+                "unexpected security_domain: "
+                f"{secure.security_domain_name} "
+                f"expected={security_domain_name(crypto.security_domain)}"
+            )
+        if secure.key_id != crypto.key_id:
+            raise AppFrameError(
+                f"unexpected key_id: {secure.key_id} expected={crypto.key_id}"
+            )
+        if secure.key_epoch != crypto.key_epoch:
+            raise AppFrameError(
+                "unexpected key_epoch: "
+                f"{secure.key_epoch} expected={crypto.key_epoch}"
+            )
+
+    def encrypt_e2e_payload(
+        *,
+        route_origin_type: int,
+        route_origin_id: int,
+        route_destination_type: int,
+        route_destination_id: int,
+        route_origin_seq: int,
+        route_traffic_class: int,
+        route_inner_type: int,
+        plaintext: bytes,
+    ) -> tuple[bytes, E2ECryptoConfig]:
+        crypto = e2e_crypto_for_outbound(route_traffic_class)
+        if crypto is None:
+            raise AppFrameError(
+                f"no E2E crypto configured for "
+                f"traffic_class={traffic_class_name(route_traffic_class)}"
+            )
+        aad = _route_v2_e2e_aad(
+            origin_type=route_origin_type,
+            origin_id=route_origin_id,
+            destination_type=route_destination_type,
+            destination_id=route_destination_id,
+            origin_seq=route_origin_seq,
+            traffic_class=route_traffic_class,
+            inner_type=route_inner_type,
+            plaintext_len=len(plaintext),
+        )
+        return (
+            encode_secure_payload(
+                key=crypto.key,
+                security_domain=crypto.security_domain,
+                key_id=crypto.key_id,
+                key_epoch=crypto.key_epoch,
+                plaintext=plaintext,
+                associated_data=aad,
+            ),
+            crypto,
+        )
+
+    def route_v2_is_own(route) -> bool:
+        return route.origin_type == origin_type and route.origin_id == args.sender_id
+
+    def route_v2_delivered(route) -> bool:
+        if route.destination_type == ADDR_BROADCAST:
+            return True
+        return (
+            route.destination_type == origin_type
+            and route.destination_id == args.sender_id
+        )
+
+    def decrypt_e2e_payload(route) -> tuple[bytes, object]:
+        secure = decode_secure_payload(route.inner_payload)
+        crypto = e2e_crypto_for_inbound(route, secure)
+        if crypto is None:
+            raise AppFrameError("no matching local E2E key for this endpoint")
+        validate_secure_key(secure=secure, crypto=crypto)
+        aad = _route_v2_e2e_aad(
+            origin_type=route.origin_type,
+            origin_id=route.origin_id,
+            destination_type=route.destination_type,
+            destination_id=route.destination_id,
+            origin_seq=route.origin_seq,
+            traffic_class=route.traffic_class,
+            inner_type=route.inner_type,
+            plaintext_len=secure.plaintext_len,
+        )
+        plaintext = decrypt_secure_payload(
+            secure,
+            key=crypto.key,
+            associated_data=aad,
+        )
+        replay_key = (
+            secure.security_domain,
+            route.origin_type,
+            route.origin_id,
+            secure.key_epoch,
+            route.origin_seq,
+        )
+        if not secure_replay.remember(replay_key):
+            raise AppFrameError("secure replay detected")
+        return plaintext, secure
+
+    def post_c2_upload(route) -> tuple[bool, str]:
+        if args.c2_http_forward_url is None:
+            return False, "disabled"
+        if route.traffic_class != TRAFFIC_C2_UPLINK or route.destination_type != ADDR_C2:
+            return False, "not_c2_uplink"
+
+        upload = {
+            "gateway_id": args.sender_id,
+            "channel": current_channel,
+            "received_at_ms": _utc_ms(),
+            "route": {
+                "origin_type": route.origin_type_name,
+                "origin_id": route.origin_id,
+                "destination_type": route.destination_type_name,
+                "destination_id": route.destination_id,
+                "ttl": route.ttl,
+                "origin_seq": route.origin_seq,
+                "traffic_class": route.traffic_class_name,
+                "inner_type": route.inner_type_name,
+                "inner_payload_hex": route.inner_payload.hex(),
+            },
+        }
+        body = json.dumps(upload, separators=(",", ":")).encode("utf-8")
+        request = urllib.request.Request(
+            args.c2_http_forward_url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=1.5) as response:
+                response_body = response.read(4096).decode("utf-8", errors="replace")
+        except (OSError, urllib.error.URLError) as exc:
+            return False, str(exc)
+
+        if not 200 <= response.status < 300:
+            return False, f"http_status={response.status} body={response_body}"
+        try:
+            parsed = json.loads(response_body)
+        except json.JSONDecodeError:
+            return True, f"http_status={response.status}"
+        duplicate = int(bool(parsed.get("duplicate", False)))
+        return True, f"http_status={response.status} duplicate={duplicate}"
+
     def send_route(
         *,
         inner_type: int,
@@ -719,6 +1217,54 @@ def main() -> int:
         next_outer_seq = _next_seq(next_outer_seq)
         next_rf_seq = _next_seq(next_rf_seq)
         return seq_sent, routed_payload is not payload
+
+    def send_route_v2(
+        *,
+        inner_type: int,
+        payload: bytes,
+        destination_type: int,
+        destination_id: int,
+        ttl: int,
+        traffic_class: int,
+    ) -> tuple[int, E2ECryptoConfig, object]:
+        nonlocal next_origin_seq, next_outer_seq, next_rf_seq
+        if tx is None:
+            raise RuntimeError("TX handle is not open")
+
+        seq_sent = next_origin_seq
+        e2e_payload, crypto = encrypt_e2e_payload(
+            route_origin_type=origin_type,
+            route_origin_id=args.sender_id,
+            route_destination_type=destination_type,
+            route_destination_id=destination_id,
+            route_origin_seq=seq_sent,
+            route_traffic_class=traffic_class,
+            route_inner_type=inner_type,
+            plaintext=payload,
+        )
+        route_payload = encode_route_v2_payload(
+            origin_type=origin_type,
+            origin_id=args.sender_id,
+            destination_type=destination_type,
+            destination_id=destination_id,
+            ttl=ttl,
+            origin_seq=seq_sent,
+            traffic_class=traffic_class,
+            inner_type=inner_type,
+            inner_payload=e2e_payload,
+        )
+        route = decode_route_v2_payload(route_payload)
+        frame = _encode_outer_route_v2_frame(
+            sender_id=args.sender_id,
+            app_seq=next_outer_seq,
+            route_payload=route_payload,
+        )
+        tx.send(frame, seq=next_rf_seq)
+        seen.remember((origin_type, args.sender_id, seq_sent))
+        next_origin_seq = _next_seq(next_origin_seq)
+        next_outer_seq = _next_seq(next_outer_seq)
+        next_rf_seq = _next_seq(next_rf_seq)
+        return seq_sent, crypto, route
 
     def build_sync_payload() -> tuple[bytes, ScheduleState | None]:
         state = current_schedule_state()
@@ -776,7 +1322,8 @@ def main() -> int:
         agility_desc = f" agility={hop_desc}" if args.channel_agility else ""
         log(
             f"Mesh UDP mode: sender={args.sender_id} ttl={args.ttl} "
-            f"dest={args.destination_id}{agility_desc}, Ctrl-C to exit"
+            f"dest={args.destination_id} class={traffic_class_name(traffic_class)}"
+            f"{agility_desc}, Ctrl-C to exit"
         )
         state = current_schedule_state()
         if state is not None:
@@ -811,25 +1358,65 @@ def main() -> int:
                 and tx_allowed
             )
             if should_originate:
-                sent_seq, secured = send_route(
-                    inner_type=inner_type,
-                    payload=inner_payload,
-                    destination_id=args.destination_id,
-                    ttl=args.ttl,
-                )
-                if secured and mesh_crypto is not None:
-                    log(
-                        f"TX secure origin={args.sender_id} seq={sent_seq} "
-                        f"domain={security_domain_name(mesh_crypto.security_domain)} "
-                        f"key_id={mesh_crypto.key_id} "
-                        f"key_epoch={mesh_crypto.key_epoch} len={len(inner_payload)}"
+                if use_route_v2:
+                    sent_seq, e2e_crypto, sent_route = send_route_v2(
+                        inner_type=inner_type,
+                        payload=inner_payload,
+                        destination_type=destination_type,
+                        destination_id=args.destination_id,
+                        ttl=args.ttl,
+                        traffic_class=traffic_class,
                     )
-                log(
-                    f"TX route origin={args.sender_id} seq={sent_seq} "
-                    f"dest={args.destination_id} ttl={args.ttl} "
-                    f"type={args.message_type} len={len(inner_payload)} "
-                    f"secure={int(secured)}"
-                )
+                    log(
+                        f"TX e2e origin={_addr_label(origin_type, args.sender_id)} "
+                        f"seq={sent_seq} "
+                        f"dest={_addr_label(destination_type, args.destination_id)} "
+                        f"class={traffic_class_name(traffic_class)} "
+                        f"domain={security_domain_name(e2e_crypto.security_domain)} "
+                        f"key_id={e2e_crypto.key_id} "
+                        f"key_epoch={e2e_crypto.key_epoch} "
+                        f"len={len(inner_payload)}"
+                    )
+                    log(
+                        f"TX route_v2 "
+                        f"origin={_addr_label(origin_type, args.sender_id)} "
+                        f"seq={sent_seq} "
+                        f"dest={_addr_label(destination_type, args.destination_id)} "
+                        f"ttl={args.ttl} class={traffic_class_name(traffic_class)} "
+                        f"type={args.message_type} len={len(inner_payload)} "
+                        "e2e=1"
+                    )
+                    if (
+                        args.c2_http_forward_url is not None
+                        and sent_route.traffic_class == TRAFFIC_C2_UPLINK
+                    ):
+                        ok, detail = post_c2_upload(sent_route)
+                        log(
+                            f"HTTP c2_forward origin={sent_route.origin_id} "
+                            f"seq={sent_route.origin_seq} "
+                            f"dest={_addr_label(sent_route.destination_type, sent_route.destination_id)} "
+                            f"ok={int(ok)} detail=\"{detail}\""
+                        )
+                else:
+                    sent_seq, secured = send_route(
+                        inner_type=inner_type,
+                        payload=inner_payload,
+                        destination_id=args.destination_id,
+                        ttl=args.ttl,
+                    )
+                    if secured and mesh_crypto is not None:
+                        log(
+                            f"TX secure origin={args.sender_id} seq={sent_seq} "
+                            f"domain={security_domain_name(mesh_crypto.security_domain)} "
+                            f"key_id={mesh_crypto.key_id} "
+                            f"key_epoch={mesh_crypto.key_epoch} len={len(inner_payload)}"
+                        )
+                    log(
+                        f"TX route origin={args.sender_id} seq={sent_seq} "
+                        f"dest={args.destination_id} ttl={args.ttl} "
+                        f"type={args.message_type} len={len(inner_payload)} "
+                        f"secure={int(secured)}"
+                    )
                 originated_count += 1
                 next_tx_at = now + (args.tx_interval_ms / 1000.0)
 
@@ -873,6 +1460,136 @@ def main() -> int:
                     f'RX invalid_app_frame len={len(payload)} '
                     f'truncated={int(meta.truncated)} error="{exc}"'
                 )
+                continue
+
+            if frame.message_type == MSG_ROUTE_V2:
+                try:
+                    route_v2 = decode_route_v2_payload(frame.payload)
+                except AppFrameError as exc:
+                    log(
+                        f'RX invalid_route_v2 from={frame.sender_id} '
+                        f'len={len(frame.payload)} error="{exc}"'
+                    )
+                    continue
+
+                origin_label = _addr_label(route_v2.origin_type, route_v2.origin_id)
+                dest_label = _addr_label(
+                    route_v2.destination_type,
+                    route_v2.destination_id,
+                )
+                if route_v2_is_own(route_v2):
+                    seen.remember(route_v2.dedupe_key)
+                    log(
+                        f"RX own_route_v2 via={frame.sender_id} "
+                        f"origin={origin_label} seq={route_v2.origin_seq} "
+                        "dropped=1"
+                    )
+                    continue
+
+                if seen.contains(route_v2.dedupe_key):
+                    log(
+                        f"RX duplicate_route_v2 via={frame.sender_id} "
+                        f"origin={origin_label} seq={route_v2.origin_seq} "
+                        "dropped=1"
+                    )
+                    continue
+
+                try:
+                    secure = decode_secure_payload(route_v2.inner_payload)
+                except AppFrameError as exc:
+                    log(
+                        f'RX invalid_e2e via={frame.sender_id} '
+                        f"origin={origin_label} seq={route_v2.origin_seq} "
+                        f"class={route_v2.traffic_class_name} "
+                        f'error="{exc}" dropped=1'
+                    )
+                    continue
+
+                delivered_v2 = route_v2_delivered(route_v2)
+                suffix = ""
+                if args.print_rssi:
+                    suffix = (
+                        f" bw={meta.bandwidth} mcs={meta.mcs_index} "
+                        f"rssi0={meta.rssi[0]}"
+                    )
+
+                if delivered_v2 and e2e_crypto_for_inbound(route_v2, secure) is not None:
+                    try:
+                        route_payload, secure = decrypt_e2e_payload(route_v2)
+                    except AppFrameError as exc:
+                        log(
+                            f'RX auth_fail_v2 via={frame.sender_id} '
+                            f"origin={origin_label} seq={route_v2.origin_seq} "
+                            f"dest={dest_label} class={route_v2.traffic_class_name} "
+                            f'type={route_v2.inner_type_name} error="{exc}" '
+                            "dropped=1"
+                        )
+                        continue
+
+                    seen.remember(route_v2.dedupe_key)
+                    text = route_payload.decode("utf-8", errors="replace")
+                    log(
+                        f"RX e2e via={frame.sender_id} origin={origin_label} "
+                        f"seq={route_v2.origin_seq} dest={dest_label} "
+                        f"ttl={route_v2.ttl} class={route_v2.traffic_class_name} "
+                        f"type={route_v2.inner_type_name} "
+                        f"domain={secure.security_domain_name} "
+                        f"key_id={secure.key_id} key_epoch={secure.key_epoch} "
+                        f'decrypted=1 payload="{text}"{suffix}'
+                    )
+                else:
+                    seen.remember(route_v2.dedupe_key)
+                    log(
+                        f"RX opaque_route via={frame.sender_id} "
+                        f"origin={origin_label} seq={route_v2.origin_seq} "
+                        f"dest={dest_label} ttl={route_v2.ttl} "
+                        f"class={route_v2.traffic_class_name} "
+                        f"type={route_v2.inner_type_name} "
+                        f"domain={secure.security_domain_name} "
+                        f"key_id={secure.key_id} key_epoch={secure.key_epoch} "
+                        f"delivered={int(delivered_v2)} decrypt_skipped=1{suffix}"
+                    )
+
+                if (
+                    args.c2_http_forward_url is not None
+                    and route_v2.traffic_class == TRAFFIC_C2_UPLINK
+                ):
+                    ok, detail = post_c2_upload(route_v2)
+                    log(
+                        f"HTTP c2_forward origin={origin_label} "
+                        f"seq={route_v2.origin_seq} dest={dest_label} "
+                        f"ok={int(ok)} detail=\"{detail}\""
+                    )
+
+                if route_v2.ttl <= 0:
+                    continue
+
+                forwarded = route_v2.decremented_ttl()
+                forward_payload = encode_route_v2_payload(
+                    origin_type=forwarded.origin_type,
+                    origin_id=forwarded.origin_id,
+                    destination_type=forwarded.destination_type,
+                    destination_id=forwarded.destination_id,
+                    ttl=forwarded.ttl,
+                    origin_seq=forwarded.origin_seq,
+                    traffic_class=forwarded.traffic_class,
+                    inner_type=forwarded.inner_type,
+                    inner_payload=forwarded.inner_payload,
+                )
+                forward_frame = _encode_outer_route_v2_frame(
+                    sender_id=args.sender_id,
+                    app_seq=next_outer_seq,
+                    route_payload=forward_payload,
+                )
+                tx.send(forward_frame, seq=next_rf_seq)
+                log(
+                    f"TX forward_v2 origin={origin_label} "
+                    f"seq={forwarded.origin_seq} dest={dest_label} "
+                    f"ttl={forwarded.ttl} class={forwarded.traffic_class_name} "
+                    "opaque=1"
+                )
+                next_outer_seq = _next_seq(next_outer_seq)
+                next_rf_seq = _next_seq(next_rf_seq)
                 continue
 
             if frame.message_type != MSG_ROUTE_DATA:

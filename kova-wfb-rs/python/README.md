@@ -123,6 +123,36 @@ encrypted/authenticated with ChaCha20-Poly1305. `sync` heartbeats remain
 plaintext for observability. To temporarily debug plaintext mesh traffic, set
 `[mesh_crypto] enabled = false` in each node config.
 
+For prototype C2 end-to-end encryption, switch a sender to `route_v2` with
+`traffic_class=c2_uplink`. The cloud C2 HTTP receiver decrypts uploaded opaque
+payloads and displays them per node:
+
+```bash
+sudo -E "$VIRTUAL_ENV/bin/python" examples/c2_http_server.py \
+  --config ../configs/c2-local.ini --host 0.0.0.0 --port 8080
+```
+
+Relays forward encrypted payloads without decrypting them. To send and upload
+one from a node/gateway machine:
+
+```bash
+sudo -E "$VIRTUAL_ENV/bin/python" examples/mesh_txrx.py \
+  --config ../configs/node1.ini \
+  --traffic-class c2_uplink --message-type data \
+  --message "node 1 c2 test" --count 0 --tx-interval-ms 1000 \
+  --c2-http-forward-url http://80.69.173.183:8080/ingest
+```
+
+An optional local RF C2/gateway listener is provided for testing before the
+cloud C2 exists. Edit its `iface`, then run:
+
+```bash
+sudo -E "$VIRTUAL_ENV/bin/python" examples/mesh_txrx.py --config ../configs/c2-local.ini
+```
+
+Relay logs should show `RX opaque_route ... decrypt_skipped=1`; the matching
+C2/gateway endpoint should show `RX e2e ... decrypted=1 payload="..."`.
+
 ## Tests
 
 ```bash

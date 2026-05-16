@@ -16,6 +16,9 @@ prototype:
 - sync heartbeats showing `slot_delta=0` and `channel_match=1`
 - UDP-like packet loss behavior; no retransmission dependency
 - Phase A mesh-group crypto implemented with ChaCha20-Poly1305
+- Phase B route v2 and first E2E C2 payload mode implemented
+- Tiny C2 HTTP receiver implemented for decrypting and displaying
+  `node_to_c2` uplinks per node
 - mesh crypto is config-only through `[mesh_crypto]`
 - Python and config defaults now use the team stream ID
 
@@ -167,6 +170,10 @@ frames during debugging.
 - Current secure mesh mode is not node-to-C2 end-to-end encryption. It encrypts
   mesh payload bytes with the shared `mesh_group` key. Routing metadata remains
   visible on the wire.
+- Route v2 now supports typed `node`/`c2` destinations and opaque E2E
+  `node_to_c2` / `c2_to_node` payloads for prototype testing.
+- `mesh_txrx.py` can forward opaque C2 uplinks to an HTTP `/ingest` endpoint
+  without decrypting them.
 - No ACK/retry/session example is implemented.
 
 ## Current Wire Visibility
@@ -216,6 +223,34 @@ Planned Phase B:
   relays forward opaque encrypted payloads
   only the endpoint can decrypt C2 payloads
 ```
+
+Implemented Phase B slice:
+
+```text
+route_v2 metadata:
+  origin_type
+  origin_id
+  destination_type
+  destination_id
+  ttl
+  origin_seq
+  traffic_class
+  inner_type
+  encrypted_payload_len
+
+E2E payload:
+  secure_version
+  security_domain
+  key_id
+  key_epoch
+  nonce
+  ciphertext_and_tag
+```
+
+For E2E C2 traffic, relays can still see the route metadata above. They do not
+decrypt the inner payload, and they forward it unchanged while decrementing
+`ttl`. The E2E associated data authenticates immutable route fields but does not
+include `ttl`, because `ttl` is intentionally mutable by relays.
 
 ## Node-To-Node Test
 
@@ -921,11 +956,19 @@ Phase A - secure mesh baseline:
 
 Phase B - opaque C2 traffic:
 
-- add `destination_type`: node, C2, broadcast
-- add `node_to_c2` and `c2_to_node` key configs
-- let relays forward C2 packets without decrypting
-- only endpoints decrypt
-- preserve only enough outer metadata for relays to route C2 traffic
+- implemented: add `route_v2` with `origin_type`, `destination_type`, and
+  `traffic_class`
+- implemented: add `node_to_c2` and `c2_to_node` config sections
+- implemented: let relays forward C2 packets without decrypting
+- implemented: only matching local endpoints decrypt when they have the key
+- implemented: add optional local C2/gateway config with multiple uplink keys
+- implemented: add a small C2 HTTP server that decrypts uploaded
+  `node_to_c2` payloads and displays them per node
+- implemented: add optional HTTP forwarding from `mesh_txrx.py` to C2 `/ingest`
+- current limitation: route metadata has E2E integrity but no separate outer hop
+  authentication layer yet
+- next: deploy/run the C2 HTTP receiver on the UpCloud host and RF-test
+  `c2_uplink` uploads through the mesh
 
 Phase C - C2 command authority:
 

@@ -304,3 +304,41 @@ CH=36 TX secure origin=1 seq=... domain=mesh_group key_id=1001 key_epoch=1 len=1
 CH=36 RX secure via=2 origin=2 seq=... domain=mesh_group key_id=1001 key_epoch=1 decrypted=1
 CH=36 RX deliver via=2 origin=2 seq=... dest=0 ttl=2 type=status payload=[encrypted]
 ```
+
+For prototype C2 end-to-end encryption, use `route_v2` by switching a node to
+`traffic_class=c2_uplink`. Relays forward these packets as opaque ciphertext and
+do not decrypt the payload. The cloud C2 HTTP receiver decrypts the uploaded
+opaque payloads and shows them in a small web UI:
+
+```bash
+sudo -E "$VIRTUAL_ENV/bin/python" python/examples/c2_http_server.py \
+  --config configs/c2-local.ini --host 0.0.0.0 --port 8080
+```
+
+Then open:
+
+```text
+http://80.69.173.183:8080/
+```
+
+A local RF C2/gateway listener can still be used when testing without the cloud:
+
+```bash
+# Edit configs/c2-local.ini iface first.
+sudo -E "$VIRTUAL_ENV/bin/python" python/examples/mesh_txrx.py --config configs/c2-local.ini
+```
+
+Stop the node 1 status process before reusing the same dongle, then send an
+opaque C2-bound datagram:
+
+```bash
+sudo -E "$VIRTUAL_ENV/bin/python" python/examples/mesh_txrx.py \
+  --config configs/node1.ini \
+  --traffic-class c2_uplink --message-type data \
+  --message "node 1 c2 test" --count 0 --tx-interval-ms 1000 \
+  --c2-http-forward-url http://80.69.173.183:8080/ingest
+```
+
+Relay nodes should log `RX opaque_route ... decrypt_skipped=1`. The matching
+C2/gateway endpoint should log `RX e2e ... decrypted=1 payload="..."`; the HTTP
+gateway path logs `HTTP c2_forward ... ok=1`.

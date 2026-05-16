@@ -1148,8 +1148,8 @@ def parse_args() -> argparse.Namespace:
         default=config_defaults.get("down_after_s", 6.0),
     )
     args = parser.parse_args()
-    if args.source not in {"sim", "radio", "both"}:
-        parser.error("--source must be one of: sim, radio, both")
+    if args.source not in {"sim", "radio", "both", "feed"}:
+        parser.error("--source must be one of: sim, radio, both, feed")
     return args
 
 

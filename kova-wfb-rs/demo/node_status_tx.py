@@ -17,6 +17,8 @@ MAX_U32 = 0xFFFF_FFFF
 if str(PY_SRC) not in sys.path:
     sys.path.insert(0, str(PY_SRC))
 
+from radio_iface import resolve_iface
+
 
 def _next_seq(seq: int) -> int:
     seq = (seq + 1) & MAX_U32
@@ -90,7 +92,10 @@ def _set_channel(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Transmit dashboard-friendly status heartbeats")
-    parser.add_argument("--iface", required=True, help="monitor-mode TX interface")
+    parser.add_argument(
+        "--iface",
+        help="monitor-mode TX interface (default: $NIC, $WFB_IFACE, $IFACE, or single iw dev interface)",
+    )
     parser.add_argument("--stream-id", type=lambda value: int(value, 0), default=1)
     parser.add_argument("--sender-id", type=lambda value: int(value, 0), required=True)
     parser.add_argument("--label", help="display label, default TX-<sender-id>")
@@ -133,6 +138,7 @@ def main() -> int:
     )
 
     args = parse_args()
+    args.iface = resolve_iface(args.iface, purpose="status transmitter")
     if not 1 <= args.sender_id <= 255:
         raise SystemExit("--sender-id must be in range 1..255")
     if not 0 <= args.destination_id <= 255:

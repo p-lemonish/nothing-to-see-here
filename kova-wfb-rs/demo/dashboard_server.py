@@ -27,6 +27,8 @@ MAX_U32 = 0xFFFF_FFFF
 if str(PY_SRC) not in sys.path:
     sys.path.insert(0, str(PY_SRC))
 
+from radio_iface import resolve_iface
+
 
 @dataclass
 class NodeRecord:
@@ -911,7 +913,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--source", choices=("sim", "radio", "both"), default="sim")
-    parser.add_argument("--iface", help="monitor-mode interface for radio source")
+    parser.add_argument(
+        "--iface",
+        help="monitor-mode interface for radio source (default: $NIC, $WFB_IFACE, $IFACE, or single iw dev interface)",
+    )
     parser.add_argument("--stream-id", type=lambda value: int(value, 0), default=1)
     parser.add_argument("--radio-timeout-ms", type=int, default=100)
     parser.add_argument(
@@ -944,8 +949,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.source in {"radio", "both"} and not args.iface:
-        raise SystemExit("--iface is required for --source radio or --source both")
+    if args.source in {"radio", "both"}:
+        args.iface = resolve_iface(args.iface, purpose=f"--source {args.source}")
     hop_channels = _parse_csv_ints(args.hop_channels)
     if args.channel_agility:
         if not hop_channels:

@@ -34,8 +34,13 @@ iw dev
 Then configure it. Use the same channel on every machine:
 
 ```bash
+export NIC=wlx... # replace with the Interface value from iw dev
 demo/setup_monitor.sh "$NIC" 36
 ```
+
+The Python demo scripts use `--iface` when supplied, otherwise `$NIC`,
+`$WFB_IFACE`, `$IFACE`, or the single interface reported by `iw dev`.
+If more than one interface is present, pass `--iface` explicitly.
 
 ## Simulated Dashboard
 
@@ -56,7 +61,6 @@ transmitters, then run:
 ```bash
 sudo -E python3 demo/dashboard_server.py \
   --source radio \
-  --iface "$RXNIC" \
   --stream-id 1
 ```
 
@@ -70,7 +74,6 @@ base dashboard with the same schedule:
 ```bash
 sudo -E python3 demo/dashboard_server.py \
   --source radio \
-  --iface "$RXNIC" \
   --stream-id 1 \
   --channel-agility \
   --hop-channels 36,40,48 \
@@ -84,7 +87,6 @@ On each transmitter host/interface:
 
 ```bash
 sudo -E python3 demo/node_status_tx.py \
-  --iface "$TXNIC" \
   --stream-id 1 \
   --sender-id 1 \
   --label TX-1 \

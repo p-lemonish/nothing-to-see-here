@@ -1,0 +1,36 @@
+{
+  "nodes": [
+    {
+      "id": 0,
+      "label": "BASE",
+      "kind": "receiver",
+      "role": "base",
+      "x": 0.5,
+      "y": 0.88
+    },
+    {
+      "id": 1,
+      "label": "TX-1",
+      "kind": "real",
+      "role": "drone",
+      "x": 0.18,
+      "y": 0.34
+    },
+    {
+      "id": 2,
+      "label": "TX-2",
+      "kind": "real",
+      "role": "drone",
+      "x": 0.54,
+      "y": 0.22
+    },
+    {
+      "id": 3,
+      "label": "TX-3",
+      "kind": "real",
+      "role": "drone",
+      "x": 0.82,
+      "y": 0.48
+    }
+  ]
+}

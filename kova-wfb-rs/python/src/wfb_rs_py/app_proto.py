@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import struct
 from dataclasses import dataclass
 
@@ -10,6 +11,9 @@ MAX_U8 = 0xFF
 MAX_U16 = 0xFFFF
 MAX_U32 = 0xFFFF_FFFF
 MAX_U64 = 0xFFFF_FFFF_FFFF_FFFF
+CHACHA20_POLY1305_KEY_SIZE = 32
+CHACHA20_POLY1305_NONCE_SIZE = 12
+CHACHA20_POLY1305_TAG_SIZE = 16
 
 MSG_HELLO = 0x01
 MSG_TEXT = 0x02
@@ -36,6 +40,27 @@ ROUTE_DATA_PAYLOAD = struct.Struct("!BBBIBH")
 ROUTE_DATA_PAYLOAD_SIZE = ROUTE_DATA_PAYLOAD.size
 SYNC_PAYLOAD = struct.Struct("!QIHI")
 SYNC_PAYLOAD_SIZE = SYNC_PAYLOAD.size
+SECURE_VERSION = 1
+SECURE_PAYLOAD = struct.Struct("!BBHI12s")
+SECURE_PAYLOAD_SIZE = SECURE_PAYLOAD.size
+
+SEC_DOMAIN_MESH_GROUP = 0x01
+SEC_DOMAIN_NODE_TO_NODE_PAIRWISE = 0x02
+SEC_DOMAIN_NODE_TO_C2 = 0x03
+SEC_DOMAIN_C2_TO_NODE = 0x04
+SEC_DOMAIN_C2_BROADCAST = 0x05
+SEC_DOMAIN_REKEY_CONTROL = 0x06
+
+SECURITY_DOMAINS: dict[str, int] = {
+    "mesh_group": SEC_DOMAIN_MESH_GROUP,
+    "node_to_node_pairwise": SEC_DOMAIN_NODE_TO_NODE_PAIRWISE,
+    "node_to_c2": SEC_DOMAIN_NODE_TO_C2,
+    "c2_to_node": SEC_DOMAIN_C2_TO_NODE,
+    "c2_broadcast": SEC_DOMAIN_C2_BROADCAST,
+    "rekey_control": SEC_DOMAIN_REKEY_CONTROL,
+}
+
+SECURITY_DOMAIN_NAMES = {value: name for name, value in SECURITY_DOMAINS.items()}
 
 
 class AppFrameError(ValueError):
@@ -94,6 +119,24 @@ class SyncStatus:
     next_hop_ms: int
 
 
+@dataclass(frozen=True)
+class SecurePayload:
+    secure_version: int
+    security_domain: int
+    key_id: int
+    key_epoch: int
+    nonce: bytes
+    ciphertext_and_tag: bytes
+
+    @property
+    def security_domain_name(self) -> str:
+        return security_domain_name(self.security_domain)
+
+    @property
+    def plaintext_len(self) -> int:
+        return len(self.ciphertext_and_tag) - CHACHA20_POLY1305_TAG_SIZE
+
+
 def _require_u8(name: str, value: int) -> None:
     if not 0 <= value <= MAX_U8:
         raise AppFrameError(f"{name} must fit in u8: {value}")
@@ -135,6 +178,31 @@ def message_type_value(value: str | int) -> int:
 
 def message_type_name(value: int) -> str:
     return MESSAGE_TYPE_NAMES.get(value, f"0x{value:02x}")
+
+
+def security_domain_value(value: str | int) -> int:
+    if isinstance(value, int):
+        _require_u8("security_domain", value)
+        return value
+
+    text = value.strip().lower()
+    if text in SECURITY_DOMAINS:
+        return SECURITY_DOMAINS[text]
+
+    try:
+        parsed = int(text, 0)
+    except ValueError as exc:
+        valid = ", ".join(sorted(SECURITY_DOMAINS))
+        raise AppFrameError(
+            f"unknown security domain '{value}' (valid: {valid})"
+        ) from exc
+
+    _require_u8("security_domain", parsed)
+    return parsed
+
+
+def security_domain_name(value: int) -> str:
+    return SECURITY_DOMAIN_NAMES.get(value, f"0x{value:02x}")
 
 
 def encode_frame(
@@ -259,6 +327,140 @@ def decode_sync_payload(payload: bytes) -> SyncStatus:
         channel=channel,
         next_hop_ms=next_hop_ms,
     )
+
+
+def _require_aead_key(key: bytes) -> None:
+    if len(key) != CHACHA20_POLY1305_KEY_SIZE:
+        raise AppFrameError(
+            "ChaCha20-Poly1305 key must be "
+            f"{CHACHA20_POLY1305_KEY_SIZE} bytes, got {len(key)}"
+        )
+
+
+def _chacha20_poly1305(key: bytes):
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    except ImportError as exc:
+        raise AppFrameError(
+            "secure payloads require the 'cryptography' Python package"
+        ) from exc
+    return ChaCha20Poly1305(key)
+
+
+def _secure_auth_header(
+    *,
+    secure_version: int,
+    security_domain: int,
+    key_id: int,
+    key_epoch: int,
+) -> bytes:
+    return SECURE_PAYLOAD.pack(
+        secure_version,
+        security_domain,
+        key_id,
+        key_epoch,
+        b"\x00" * CHACHA20_POLY1305_NONCE_SIZE,
+    )[:8]
+
+
+def _secure_aad(payload: SecurePayload, associated_data: bytes) -> bytes:
+    return (
+        _secure_auth_header(
+            secure_version=payload.secure_version,
+            security_domain=payload.security_domain,
+            key_id=payload.key_id,
+            key_epoch=payload.key_epoch,
+        )
+        + associated_data
+    )
+
+
+def encode_secure_payload(
+    *,
+    key: bytes,
+    security_domain: str | int,
+    key_id: int,
+    key_epoch: int,
+    plaintext: bytes,
+    associated_data: bytes,
+    nonce: bytes | None = None,
+) -> bytes:
+    _require_aead_key(key)
+    domain = security_domain_value(security_domain)
+    _require_u16("key_id", key_id)
+    _require_u32("key_epoch", key_epoch)
+    if nonce is None:
+        nonce = os.urandom(CHACHA20_POLY1305_NONCE_SIZE)
+    if len(nonce) != CHACHA20_POLY1305_NONCE_SIZE:
+        raise AppFrameError(
+            "ChaCha20-Poly1305 nonce must be "
+            f"{CHACHA20_POLY1305_NONCE_SIZE} bytes, got {len(nonce)}"
+        )
+
+    auth_header = _secure_auth_header(
+        secure_version=SECURE_VERSION,
+        security_domain=domain,
+        key_id=key_id,
+        key_epoch=key_epoch,
+    )
+    ciphertext_and_tag = _chacha20_poly1305(key).encrypt(
+        nonce,
+        plaintext,
+        auth_header + associated_data,
+    )
+    return (
+        SECURE_PAYLOAD.pack(SECURE_VERSION, domain, key_id, key_epoch, nonce)
+        + ciphertext_and_tag
+    )
+
+
+def decode_secure_payload(payload: bytes) -> SecurePayload:
+    if len(payload) < SECURE_PAYLOAD_SIZE + CHACHA20_POLY1305_TAG_SIZE:
+        raise AppFrameError(
+            "secure payload too short: "
+            f"{len(payload)} < {SECURE_PAYLOAD_SIZE + CHACHA20_POLY1305_TAG_SIZE}"
+        )
+
+    secure_version, domain, key_id, key_epoch, nonce = SECURE_PAYLOAD.unpack_from(
+        payload
+    )
+    ciphertext_and_tag = payload[SECURE_PAYLOAD_SIZE:]
+    if secure_version != SECURE_VERSION:
+        raise AppFrameError(f"unsupported secure_version: {secure_version}")
+    if domain not in SECURITY_DOMAIN_NAMES:
+        raise AppFrameError(f"unknown security_domain: 0x{domain:02x}")
+
+    return SecurePayload(
+        secure_version=secure_version,
+        security_domain=domain,
+        key_id=key_id,
+        key_epoch=key_epoch,
+        nonce=nonce,
+        ciphertext_and_tag=ciphertext_and_tag,
+    )
+
+
+def decrypt_secure_payload(
+    payload: SecurePayload,
+    *,
+    key: bytes,
+    associated_data: bytes,
+) -> bytes:
+    _require_aead_key(key)
+    try:
+        from cryptography.exceptions import InvalidTag
+    except ImportError as exc:
+        raise AppFrameError(
+            "secure payloads require the 'cryptography' Python package"
+        ) from exc
+    try:
+        return _chacha20_poly1305(key).decrypt(
+            payload.nonce,
+            payload.ciphertext_and_tag,
+            _secure_aad(payload, associated_data),
+        )
+    except InvalidTag as exc:
+        raise AppFrameError("secure payload authentication failed") from exc
 
 
 def decode_frame(frame: bytes, *, allow_unknown_message_type: bool = False) -> AppFrame:

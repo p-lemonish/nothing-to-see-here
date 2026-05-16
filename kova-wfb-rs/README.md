@@ -280,3 +280,18 @@ To hold a node on its current channel while debugging, add `--no-channel-agility
 sudo -E "$VIRTUAL_ENV/bin/python" python/examples/mesh_txrx.py \
   --config configs/node1.ini --no-channel-agility
 ```
+
+The starter configs enable `[mesh_crypto]` by default. Keep the same `key_id`,
+`key_epoch`, and 32-byte `key_hex` on every node. Non-`sync` mesh payloads are
+encrypted/authenticated with ChaCha20-Poly1305; relays authenticate, decrypt,
+decrement TTL, and re-encrypt mesh-group traffic for the next hop. `sync`
+heartbeats remain plaintext for observability. To temporarily debug plaintext
+mesh traffic, set `[mesh_crypto] enabled = false` in each node config.
+
+Expected secure-mode log shape:
+
+```text
+CH=36 TX secure origin=1 seq=... domain=mesh_group key_id=1001 key_epoch=1 len=13
+CH=36 RX secure via=2 origin=2 seq=... domain=mesh_group key_id=1001 key_epoch=1 decrypted=1
+CH=36 RX deliver via=2 origin=2 seq=... dest=0 ttl=2 type=status payload=[encrypted]
+```

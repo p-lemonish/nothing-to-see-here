@@ -2,22 +2,30 @@ import pytest
 
 from wfb_rs_py.app_proto import (
     AppFrameError,
+    CHACHA20_POLY1305_TAG_SIZE,
     HEADER_SIZE,
     MSG_HELLO,
     MSG_ROUTE_DATA,
     MSG_STATUS,
     MSG_SYNC,
+    SECURE_PAYLOAD_SIZE,
+    SEC_DOMAIN_MESH_GROUP,
     SYNC_PAYLOAD_SIZE,
     ROUTE_DATA_PAYLOAD_SIZE,
     VERSION,
     decode_frame,
     decode_route_data_payload,
+    decode_secure_payload,
     decode_sync_payload,
+    decrypt_secure_payload,
     encode_frame,
     encode_route_data_payload,
+    encode_secure_payload,
     encode_sync_payload,
     message_type_name,
     message_type_value,
+    security_domain_name,
+    security_domain_value,
 )
 
 
@@ -248,3 +256,59 @@ def test_sync_payload_length_mismatch_is_invalid():
 def test_sync_message_type_is_known():
     assert message_type_value("sync") == MSG_SYNC
     assert message_type_name(MSG_SYNC) == "sync"
+
+
+def test_encode_decode_decrypt_secure_payload():
+    key = bytes(range(32))
+    nonce = bytes(range(12))
+    aad = b"route-metadata"
+
+    encoded = encode_secure_payload(
+        key=key,
+        security_domain="mesh_group",
+        key_id=1001,
+        key_epoch=7,
+        plaintext=b"node 1 online",
+        associated_data=aad,
+        nonce=nonce,
+    )
+    secure = decode_secure_payload(encoded)
+    plaintext = decrypt_secure_payload(secure, key=key, associated_data=aad)
+
+    assert len(encoded) == SECURE_PAYLOAD_SIZE + len(b"node 1 online") + 16
+    assert secure.security_domain == SEC_DOMAIN_MESH_GROUP
+    assert secure.security_domain_name == "mesh_group"
+    assert secure.key_id == 1001
+    assert secure.key_epoch == 7
+    assert secure.nonce == nonce
+    assert secure.plaintext_len == len(b"node 1 online")
+    assert plaintext == b"node 1 online"
+
+
+def test_secure_payload_authenticates_associated_data():
+    key = bytes(range(32))
+    encoded = encode_secure_payload(
+        key=key,
+        security_domain="mesh_group",
+        key_id=1001,
+        key_epoch=7,
+        plaintext=b"node 1 online",
+        associated_data=b"good-aad",
+        nonce=bytes(range(12)),
+    )
+    secure = decode_secure_payload(encoded)
+
+    with pytest.raises(AppFrameError, match="authentication failed"):
+        decrypt_secure_payload(secure, key=key, associated_data=b"bad-aad")
+
+
+def test_secure_payload_rejects_short_wrapper():
+    with pytest.raises(AppFrameError, match="secure payload too short"):
+        decode_secure_payload(b"x" * (SECURE_PAYLOAD_SIZE + CHACHA20_POLY1305_TAG_SIZE - 1))
+
+
+def test_security_domain_value_and_name():
+    assert security_domain_value("mesh_group") == SEC_DOMAIN_MESH_GROUP
+    assert security_domain_value("0x01") == SEC_DOMAIN_MESH_GROUP
+    assert security_domain_name(SEC_DOMAIN_MESH_GROUP) == "mesh_group"
+    assert security_domain_name(0x99) == "0x99"

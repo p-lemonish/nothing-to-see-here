@@ -136,8 +136,18 @@ frames during debugging.
 - `python/examples/mesh_txrx.py` uses Unix UTC time for the hop schedule,
   prints clock/schedule state, applies a TX guard after channel changes, and can
   send compact `sync` heartbeats for clock/slot/channel observability.
+- `app_proto.py` contains secure wrapper v1 helpers for ChaCha20-Poly1305 with
+  `secure_version`, `security_domain`, `key_id`, `key_epoch`, `nonce`, and
+  `ciphertext_and_tag`.
+- `python/examples/mesh_txrx.py` supports Phase A mesh-group crypto for
+  non-`sync` routed payloads when `[mesh_crypto] enabled = true`.
+- Mesh crypto is controlled by config only; there is no runtime CLI override for
+  enabling/disabling it or changing keys.
+- `mesh_txrx.py` authenticates secure mesh payloads before delivery/forwarding,
+  re-encrypts mesh-group traffic after TTL decrement, and keeps a replay window.
 - Live tests have validated three nodes using TTL forwarding, deduplication,
   channel hopping, and sync heartbeats.
+- Secure mesh mode still needs a live three-node RF test.
 - No ACK/retry/session example is implemented.
 
 ## Node-To-Node Test
@@ -337,64 +347,163 @@ but they should not be the default mesh mode.
 ## Next Phase: Crypto First
 
 The mesh transport now works at a simple UDP-like level. The next phase is
-confidentiality and authenticity. Compression and structured status can wait.
+confidentiality, authenticity, and compromise containment. Compression and
+structured status can wait.
+
+The key design shift:
+
+```text
+Use layered security.
+
+Mesh layer:
+  authenticates forwarding metadata and controls spoofed flooding.
+
+End-to-end layer:
+  encrypts actual node-to-C2, C2-to-node, or private node-to-node payloads.
+
+Relays:
+  forward C2 traffic without decrypting it.
+
+Captured node:
+  may compromise its own keys, but not other nodes' C2 traffic.
+```
+
+Do not use one universal key for all traffic except as a temporary debug mode.
 
 Implementation order:
 
-1. Add config-based shared keys.
-2. Add AEAD secure payload encode/decode helpers and tests.
-3. Encrypt routed inner payloads.
-4. Authenticate route metadata as associated data.
-5. Drop unauthenticated secure frames before delivery or forwarding.
-6. Add clear crypto logs that do not print secrets.
-7. Keep plaintext mode available for debugging.
-8. Add optional compression later.
-9. Add structured status later.
-10. Add passive channel-health metrics later.
+1. Keep current plaintext mode for debugging only.
+2. Add secure wrapper v1 with security domain and key epoch.
+3. Add config sections for separate mesh, C2, identity, and trusted-C2 keys.
+4. Implement mesh-group AEAD for node-to-node broadcast traffic.
+5. Implement node-to-C2 opaque payloads that relays forward but cannot decrypt.
+6. Implement C2-to-node opaque payloads that only the target node can decrypt.
+7. Add C2 command signatures and expiry checks.
+8. Add replay windows per security domain.
+9. Add C2-signed revocation and rekey messages.
+10. Only after that, work on adaptive channel switching messages.
 
-### 1. Config-Based Shared Keys
+### 1. Trust Domains
 
-Start with static shared keys in config files for hackathon speed.
+Treat node-to-node mesh security and node-to-C2 security as separate trust
+domains.
 
-Config example:
-
-```ini
-secure = true
-key_id = 1
-key_hex = 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
-```
-
-Rules:
-
-- `key_hex` must decode to 32 bytes for ChaCha20-Poly1305.
-- `key_id` is sent in the secure wrapper.
-- Receivers choose the right key by `key_id`.
-- Do not print keys in logs.
-- Keep keys out of packet captures and screenshots.
-- For the first version, all mesh nodes can share one symmetric group key.
-- Later, support key rotation and per-peer keys.
-
-### 2. AEAD Secure Payload Wrapper
-
-Add encryption/authentication as an inner payload wrapper. Do not change the
-10-byte base app header and do not change the `route_data` wrapper.
-
-Use:
+Security domains:
 
 ```text
-ChaCha20-Poly1305
+0x01 = mesh_group
+0x02 = node_to_node_pairwise
+0x03 = node_to_c2
+0x04 = c2_to_node
+0x05 = c2_broadcast
+0x06 = rekey_control
 ```
+
+Key classes:
+
+```text
+K_node_mesh_group_epoch_N
+K_node_pair_A_B_epoch_N
+K_node_X_to_c2_epoch_N
+K_c2_to_node_X_epoch_N
+K_c2_broadcast_epoch_N
+```
+
+Purpose:
+
+- `mesh_group`: routine mesh status, presence, neighbor summaries, and
+  low-sensitivity coordination.
+- `node_to_node_pairwise`: private node-to-node payloads when needed.
+- `node_to_c2`: node reports back to C2; other drones may relay but cannot
+  decrypt.
+- `c2_to_node`: commands or tasking from C2 to one node; other drones may relay
+  but cannot decrypt.
+- `c2_broadcast`: C2 messages intended for all currently trusted nodes.
+- `rekey_control`: C2-signed revocation and key epoch updates.
+
+The first prototype may use a mesh group key for routine node-to-node traffic,
+but that is only for local mesh traffic. It must not protect C2 commands or C2
+uplink payloads.
+
+### 2. Captured Node Assumptions
+
+Assume any field node may be physically captured.
+
+A captured node may reveal:
+
+- its own private identity key
+- its current node-to-C2 keys
+- the current mesh group key if stored locally
+- local logs and plaintext stored on disk
+- recent RAM contents
+
+The system should limit blast radius:
+
+- captured node cannot decrypt other nodes' C2 traffic
+- captured node cannot decrypt C2 commands intended for other nodes
+- captured node cannot decrypt old traffic after forward-secret sessions exist
+- captured node can be revoked from future group keys
+- captured node cannot forge C2 commands without the C2 private key
+- captured node cannot read future traffic after revocation and rekey
+
+### 3. Identity And Authorization Model
+
+Use asymmetric identity keys plus symmetric packet keys.
+
+Each node has:
+
+```text
+node_id
+node_public_key
+node_private_key
+```
+
+C2 has:
+
+```text
+c2_id
+c2_public_key
+c2_private_key
+```
+
+Every node knows the C2 public key. C2 knows each authorized node public key.
+
+Recommended primitives:
+
+- AEAD packets: ChaCha20-Poly1305 or XChaCha20-Poly1305.
+- C2 command signatures: Ed25519.
+- Later session establishment: X25519 key agreement plus signatures.
+
+For the prototype, static symmetric keys in config are acceptable. The packet
+format must still carry `security_domain`, `key_id`, and `key_epoch` from the
+start so key rotation does not require another packet redesign.
+
+### 4. Secure Wrapper V1
+
+Add encryption/authentication as an inner payload wrapper. Do not change the
+10-byte base app header immediately. The secure wrapper lives inside routed
+payloads and, later, direct app payloads.
 
 Secure payload wrapper:
 
 ```text
 offset  size  field
-0       4     key_id
-4       12    nonce
-16      N     ciphertext_and_tag
+0       1     secure_version
+1       1     security_domain
+2       2     key_id
+4       4     key_epoch
+8       12    nonce
+20      N     ciphertext_and_tag
 ```
 
-`ciphertext_and_tag` contains the encrypted inner payload plus the AEAD tag.
+Field meanings:
+
+- `secure_version`: start with `1`.
+- `security_domain`: one of the domain values above.
+- `key_id`: key selector inside that domain.
+- `key_epoch`: key generation used for replay control, rotation, and revocation.
+- `nonce`: 96-bit AEAD nonce.
+- `ciphertext_and_tag`: encrypted payload plus AEAD authentication tag.
 
 Nonce strategy for v1:
 
@@ -402,80 +511,372 @@ Nonce strategy for v1:
 nonce = random 96-bit value from os.urandom(12)
 ```
 
-Random nonces are simple and safe enough for the prototype as long as the same
-key is not used for an enormous number of packets. Later, switch to a
-deterministic nonce if we need stricter guarantees.
+Random nonces are simple and acceptable for the prototype. Later, use a
+deterministic nonce or XChaCha20-Poly1305 if packet volume or nonce collision
+risk becomes a concern.
 
-### 3. Authenticated Mesh Forwarding
+### 5. Layered Packet Model
 
-For `route_data`, forwarding nodes must be able to authenticate route metadata
-before forwarding.
+Separate hop authentication from end-to-end encryption.
 
-Recommended first version:
-
-- encrypt only `inner_payload`
-- keep `origin_sender_id`, `destination_id`, `ttl`, `origin_seq`, and
-  `inner_type` visible
-- authenticate route metadata as AEAD associated data
-- include `ttl` in associated data for hop authentication
-- decrement TTL during forwarding
-- after decrementing TTL, re-wrap/re-authenticate with the forwarding node's key
-
-This means each hop authenticates what it forwards. It is simpler than trying to
-preserve one authentication tag across mutable TTL.
-
-Later, add end-to-end payload auth if needed:
-
-- inner origin authentication tag over original payload
-- hop authentication tag over mutable route metadata
-
-### 4. Associated Data
-
-Associated data must include all unencrypted metadata that must not be tampered
-with.
-
-For routed frames, include:
+Packet shape:
 
 ```text
-origin_sender_id
+outer route wrapper:
+  origin_type
+  origin_id
+  destination_type
+  destination_id
+  ttl
+  route_seq
+  priority
+  traffic_class
+  inner_payload_len
+  inner_payload
+
+outer hop authentication:
+  proves this is valid mesh traffic
+  prevents random spoofed flooding
+  allows relays to forward safely
+
+inner end-to-end encryption:
+  protects actual payload from relays and unrelated captured nodes
+```
+
+For normal mesh broadcast status, the inner payload can use the mesh group key.
+
+For C2 traffic:
+
+```text
+Node 42 -> C2:
+  outer: mesh-forwardable route packet
+  inner: encrypted with K_node42_to_c2_epoch_N
+
+C2 -> Node 42:
+  outer: mesh-forwardable route packet
+  inner: encrypted with K_c2_to_node42_epoch_N
+```
+
+Relays only need enough metadata to forward. They must not decrypt C2 payloads
+unless they are the endpoint.
+
+### 6. Forwarding Rule
+
+Replace the earlier "decrypt and rewrap every hop" approach with layered
+forwarding.
+
+Forwarding node behavior:
+
+- authenticate the outer route/hop wrapper
+- drop packets that fail hop authentication
+- drop packets from revoked origins when revocation data is available
+- decrement TTL
+- update only mutable routing metadata
+- do not decrypt end-to-end payload unless it is the destination
+- re-authenticate the hop wrapper if required by the chosen hop-auth design
+
+This gives mesh availability without exposing C2 content to the mesh.
+
+### 7. Route Addressing For C2
+
+The current route format uses:
+
+```text
+destination_id, 0 means broadcast
+```
+
+That is sufficient for the current three-node mesh, but C2 needs a clearer
+address model. Add destination and origin types before implementing opaque C2
+traffic.
+
+Better route payload:
+
+```text
+origin_type
+origin_id
+destination_type
 destination_id
 ttl
 origin_seq
+traffic_class
 inner_type
-inner_plaintext_len
+inner_payload_len
+inner_payload
 ```
 
-The outer app header can remain outside the first implementation's associated
-data because forwarding changes the outer sender and outer app sequence. The
-route wrapper is the important mesh contract.
+Types:
+
+```text
+0x00 = mesh broadcast
+0x01 = node
+0x02 = c2
+```
+
+Traffic classes:
+
+```text
+0x01 = mesh_status
+0x02 = mesh_data
+0x03 = c2_uplink
+0x04 = c2_downlink
+0x05 = c2_broadcast
+0x06 = rekey_control
+```
+
+This avoids overloading drone node IDs with C2 IDs. If we need a fast
+intermediate step, reserve the high ID range:
+
+```text
+0 = mesh broadcast
+1..239 = drone node IDs
+240 = C2 broadcast / any C2
+241..254 = specific C2 IDs
+255 = reserved
+```
+
+The typed route format is cleaner and should be preferred.
+
+### 8. Associated Data
+
+Each encrypted message should authenticate the metadata that defines who sent
+it, who should receive it, what key epoch applies, and how it should be handled.
+
+Associated data for secure routed payloads should include:
+
+```text
+security_domain
+sender_id
+recipient_id or broadcast marker
+sequence_number
+key_epoch
+message_type
+expiry time
+payload length
+route origin_type/origin_id
+route destination_type/destination_id
+traffic_class
+```
+
+The hop-auth layer should also authenticate mutable route metadata as needed,
+including TTL after each forwarding mutation.
 
 Rules:
 
 - Drop frames that fail AEAD authentication.
 - Do not deliver unauthenticated secure payloads.
-- Do not forward unauthenticated secure `route_data`.
+- Do not forward packets that fail required hop authentication.
 - Keep routing metadata visible for forwarding, but authenticated.
-- Keep actual application payload confidential.
+- Keep actual C2 payloads confidential from relays.
 - Keep `sync` payloads plaintext for now unless we decide that channel/sync
   metadata must also be hidden.
 
-### 5. Crypto Logging
+### 9. Command Authorization
+
+Encryption alone says someone with the key produced a packet. C2 commands also
+need explicit command authority.
+
+For C2-to-node commands, use a C2 signature over a command envelope:
+
+```text
+command_id
+target_node_id
+issued_at
+expires_at
+command_type
+command_args
+mission_id
+key_epoch
+```
+
+Flow:
+
+```text
+C2 signs command.
+C2 encrypts signed command to node 42.
+Mesh forwards opaque encrypted blob.
+Node 42 decrypts.
+Node 42 verifies C2 signature.
+Node 42 checks expiry, target_node_id, command_id replay window.
+Node 42 executes only if valid.
+```
+
+High-risk commands must require a valid C2 signature even if the encrypted
+transport succeeds.
+
+### 10. Replay Protection
+
+Track replay windows separately for each security domain.
+
+Replay windows:
+
+```text
+mesh_group from node X
+node_to_node_pairwise from node X
+node_to_c2 from node X
+c2_to_node from C2
+c2_broadcast from C2
+rekey_control from C2
+```
+
+Do not use one global sequence space for everything. The existing per-origin
+route sequence is useful for mesh deduplication, but crypto replay protection
+needs domain-specific windows and key epochs.
+
+Reject packets when:
+
+- sequence is outside the accepted replay window
+- `key_epoch` is too old or not yet valid
+- `expires_at` is in the past
+- command target does not match the local node
+- C2 signature is missing or invalid for command traffic
+
+### 11. Revocation And Rekey
+
+Add three compromise-containment mechanisms.
+
+Revocation list:
+
+```text
+revoked_node_ids
+revocation_epoch
+issued_at
+signature_by_c2
+```
+
+Nodes reject mesh traffic from revoked nodes after receiving and verifying the
+update.
+
+Group rekey:
+
+```text
+C2 -> node 1: new mesh key encrypted to node 1
+C2 -> node 2: new mesh key encrypted to node 2
+C2 -> node 3: new mesh key encrypted to node 3
+```
+
+The revoked node does not receive the new key.
+
+Short key epochs:
+
+```text
+mission_epoch
+key_epoch
+valid_from
+valid_until
+```
+
+Packets outside the valid window are rejected after the configured grace period.
+
+### 12. Config Shape
+
+Prototype static-key config:
+
+```ini
+[node]
+node_id = 42
+
+[node_identity]
+identity_private_key_file = secrets/node42_ed25519.key
+identity_public_key_file = secrets/node42_ed25519.pub
+
+[trusted_c2]
+c2_id = 1
+c2_public_key_file = secrets/c2_ed25519.pub
+
+[mesh_crypto]
+enabled = true
+security_domain = mesh_group
+key_id = 1001
+key_epoch = 7
+key_hex = ...
+
+[c2_uplink_crypto]
+enabled = true
+security_domain = node_to_c2
+key_id = 4201
+key_epoch = 7
+key_hex = ...
+
+[c2_downlink_crypto]
+enabled = true
+security_domain = c2_to_node
+key_id = 4202
+key_epoch = 7
+key_hex = ...
+
+[c2_broadcast_crypto]
+enabled = true
+security_domain = c2_broadcast
+key_id = 9001
+key_epoch = 7
+key_hex = ...
+```
+
+For the prototype, static keys in config are fine. For hostile deployment, keys
+must be provisioned securely and rotated.
+
+### 13. Crypto Logging
 
 Add enough logs to debug interoperability without leaking secrets:
 
 ```text
-TX secure origin=1 seq=... key_id=1 len=...
-RX secure via=2 origin=2 seq=... key_id=1 decrypted=1
-RX auth_fail via=2 origin=2 seq=... key_id=1 dropped=1
+TX secure origin=1 seq=... domain=mesh_group key_id=1001 key_epoch=7 len=...
+RX secure via=2 origin=2 seq=... domain=mesh_group key_epoch=7 decrypted=1
+RX auth_fail via=2 origin=2 seq=... domain=mesh_group key_epoch=7 dropped=1
+RX route via=67 origin=node42 dest=c2 ttl=2 class=c2_uplink key_epoch=7 forwarded=1
+RX c2_downlink target=node42 key_epoch=7 decrypt_ok=1 sig_ok=1 cmd_id=812 expires_ok=1
+RX c2_downlink target=node43 not_for_me=1 forwarded=1 decrypt_skipped=1
 ```
 
 Do not log:
 
 - `key_hex`
-- plaintext payload when secure mode is enabled, unless explicitly in debug mode
-- nonces unless needed for deep debugging
+- plaintext C2 payloads
+- decrypted command bodies except in explicit local debug mode
+- nonces except in deep debug mode
+- signatures and session material in normal logs
 
-### 6. Mesh Log Ergonomics
+Do not write decrypted C2 payloads to persistent disk unless required.
+
+### 14. Practical Implementation Phases
+
+Phase A - secure mesh baseline:
+
+- implemented: add secure wrapper with `security_domain` and `key_epoch`
+- implemented: encrypt/authenticate mesh status/data with the mesh group key
+- implemented: add replay window for mesh group traffic
+- implemented: authenticate route metadata in AEAD associated data
+- next: live-test secure mesh mode across three nodes
+
+Phase B - opaque C2 traffic:
+
+- add `destination_type`: node, C2, broadcast
+- add `node_to_c2` and `c2_to_node` key configs
+- let relays forward C2 packets without decrypting
+- only endpoints decrypt
+
+Phase C - C2 command authority:
+
+- add C2 signing key
+- nodes verify C2 signatures for commands
+- add `command_id`, `issued_at`, `expires_at`, and `target_node_id`
+- reject expired, replayed, mistargeted, or unsigned commands
+
+Phase D - compromise containment:
+
+- add key epoch handling
+- add C2-signed revocation messages
+- add C2-driven group rekey
+- stop accepting old epochs after a grace period
+
+Phase E - adaptive anti-jam control:
+
+- accept channel-change or hopping-plan messages only when signed by C2 or an
+  authorized role
+- keep fixed schedule fallback
+- keep rendezvous channel
+
+### 15. Mesh Log Ergonomics
 
 Add config options:
 
@@ -493,7 +894,7 @@ Suggested behavior:
 This can happen before or after the first crypto patch. Crypto is now the main
 priority.
 
-### 7. Optional Compression
+### 16. Optional Compression
 
 Add compression only after AEAD is working.
 
@@ -526,7 +927,7 @@ Rules:
   payload header.
 - Start with `none` as default.
 
-### 8. Structured Status Payload
+### 17. Structured Status Payload
 
 Replace free-text status messages with a small binary status payload once secure
 transport is stable.
@@ -558,7 +959,7 @@ Later status fields:
 - retry/loss estimates
 - GPS/position if available
 
-### 9. Channel Agility Hardening
+### 18. Channel Agility Hardening
 
 Channel agility is relevant for availability, but it must be added carefully.
 The fixed Unix-time schedule is working. The remaining work is adaptive channel
@@ -682,16 +1083,23 @@ source.
 
 ## Next Implementation Steps
 
-1. Add Python crypto dependency wiring for ChaCha20-Poly1305.
-2. Add secure payload encode/decode helpers and tests.
-3. Add config parsing for `secure`, `key_id`, and `key_hex`.
-4. Add authenticated encryption for routed inner payloads in `mesh_txrx.py`.
-5. Ensure secure frames that fail authentication are dropped before delivery or
-   forwarding.
-6. Keep plaintext mode available with `secure = false`.
-7. Add crypto-safe logs.
-8. Re-test three nodes with `ttl=2`, channel hopping, sync heartbeats, and
-   encrypted status payloads.
-9. Add optional log quieting if the crypto test logs become too noisy.
-10. Revisit compression, structured status, and adaptive channel agility after
-    crypto is stable.
+1. Re-test three nodes with `[mesh_crypto] enabled = true`, `ttl=2`, channel
+   hopping, and sync heartbeats.
+2. Keep current plaintext mode available for debugging only.
+3. Add typed route addressing with `origin_type`, `destination_type`, and
+   `traffic_class`.
+4. Add config sections for C2 keys: `[c2_uplink_crypto]`,
+   `[c2_downlink_crypto]`, `[c2_broadcast_crypto]`, `[node_identity]`, and
+   `[trusted_c2]`.
+5. Implement node-to-C2 opaque payloads: relays can forward, only C2 can
+   decrypt.
+6. Implement C2-to-node opaque payloads: relays can forward, only the target
+   node can decrypt.
+7. Add C2 command signatures, expiry checks, target checks, and command replay
+   windows.
+8. Add key epochs to every secure packet and reject stale epochs after a grace
+    period.
+9. Add C2-signed revocation and group rekey messages.
+10. Re-test three nodes with secure mesh status and opaque C2 test payloads.
+11. Only after that, work on adaptive channel switching messages.
+12. Keep channel hopping decisions based on authenticated data only.

@@ -301,7 +301,6 @@ def render_html(latest_events: list[dict[str, Any]]) -> bytes:
         "<head>",
         '<meta charset="utf-8">',
         '<meta name="viewport" content="width=device-width, initial-scale=1">',
-        '<meta http-equiv="refresh" content="2">',
         "<title>Kova C2</title>",
         "<style>",
         "body{font-family:system-ui,sans-serif;margin:24px;background:#f7f7f5;color:#151515}",
@@ -342,6 +341,28 @@ def render_html(latest_events: list[dict[str, Any]]) -> bytes:
         '  }',
         '  ctx.putImageData(imgData, 0, 0);',
         '}',
+        'function pollLatest() {',
+        '  fetch("/latest").then(function(r) { return r.json(); }).then(function(data) {',
+        '    data.nodes.forEach(function(node) {',
+        '      if (node.is_image) {',
+        '        var cid = "img_" + node.origin_id;',
+        '        drawImage(cid, node.image_data_b64, node.image_width, node.image_height, node.image_pixel_format);',
+        '        var seqEl = document.getElementById("seq_" + node.origin_id);',
+        '        if (seqEl) seqEl.textContent = node.origin_seq;',
+        '        var timeEl = document.getElementById("time_" + node.origin_id);',
+        '        if (timeEl) timeEl.textContent = node.received_at_ms;',
+        '      } else {',
+        '        var txtEl = document.getElementById("txt_" + node.origin_id);',
+        '        if (txtEl) txtEl.textContent = node.payload_text;',
+        '        var seqEl = document.getElementById("seq_" + node.origin_id);',
+        '        if (seqEl) seqEl.textContent = node.origin_seq;',
+        '        var timeEl = document.getElementById("time_" + node.origin_id);',
+        '        if (timeEl) timeEl.textContent = node.received_at_ms;',
+        '      }',
+        '    });',
+        '  }).catch(function() {});',
+        '}',
+        'setInterval(pollLatest, 200);',
         '</script>',
         "</head>",
         "<body>",
@@ -357,35 +378,42 @@ def render_html(latest_events: list[dict[str, Any]]) -> bytes:
         )
         for event in latest_events:
             if event.get("is_image"):
-                canvas_id = f"img_{event['origin_id']}_{event['origin_seq']}"
+                canvas_id = f"img_{event['origin_id']}"
                 parts.append(
                     "<tr>"
                     f"<td>{event['origin_id']}</td>"
-                    f"<td>{event['received_at_ms']}</td>"
-                    f"<td>{event['origin_seq']}</td>"
+                    f"<td id=\"time_{event['origin_id']}\">{event['received_at_ms']}</td>"
+                    f"<td id=\"seq_{event['origin_id']}\">{event['origin_seq']}</td>"
                     f"<td>{html.escape(str(event['inner_type']))}</td>"
                     f"<td>{html.escape(str(event.get('gateway_id')))}</td>"
                     f"<td>{event['key_id']}:{event['key_epoch']}</td>"
                     f"<td class=\"payload\"><canvas id=\"{canvas_id}\" class=\"image-preview\" "
-                    f"width=\"{event['image_width']}\" height=\"{event['image_height']}\"></canvas>"
-                    f"<script>drawImage('{canvas_id}', '{event['image_data_b64']}', "
-                    f"{event['image_width']}, {event['image_height']}, "
-                    f"'{event['image_pixel_format']}')</script></td>"
+                    f"width=\"{event['image_width']}\" height=\"{event['image_height']}\"></canvas></td>"
                     "</tr>"
                 )
             else:
                 parts.append(
                     "<tr>"
                     f"<td>{event['origin_id']}</td>"
-                    f"<td>{event['received_at_ms']}</td>"
-                    f"<td>{event['origin_seq']}</td>"
+                    f"<td id=\"time_{event['origin_id']}\">{event['received_at_ms']}</td>"
+                    f"<td id=\"seq_{event['origin_id']}\">{event['origin_seq']}</td>"
                     f"<td>{html.escape(str(event['inner_type']))}</td>"
                     f"<td>{html.escape(str(event.get('gateway_id')))}</td>"
                     f"<td>{event['key_id']}:{event['key_epoch']}</td>"
-                    f"<td class=\"payload\"><code>{html.escape(str(event['payload_text']))}</code></td>"
+                    f"<td class=\"payload\"><code id=\"txt_{event['origin_id']}\">{html.escape(str(event['payload_text']))}</code></td>"
                     "</tr>"
                 )
         parts.append("</table>")
+    parts.append('<script>')
+    for event in latest_events:
+        if event.get("is_image"):
+            canvas_id = f"img_{event['origin_id']}"
+            parts.append(
+                f"drawImage('{canvas_id}', '{event['image_data_b64']}', "
+                f"{event['image_width']}, {event['image_height']}, "
+                f"'{event['image_pixel_format']}');"
+            )
+    parts.append('</script>')
     parts.extend(["</body>", "</html>"])
     return "\n".join(parts).encode("utf-8")
 

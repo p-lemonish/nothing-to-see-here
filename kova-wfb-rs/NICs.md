@@ -44,3 +44,8 @@ sudo -E "$VIRTUAL_ENV/bin/python" python/examples/mesh_txrx.py --config configs/
 sudo -E "$VIRTUAL_ENV/bin/python" python/examples/mesh_txrx.py --config configs/node2.ini
 sudo -E "$VIRTUAL_ENV/bin/python" python/examples/mesh_txrx.py --config configs/node3.ini
 ```
+
+C2-gateway (only lemonish pc?)
+```bash
+sudo python/.venv/bin/python python/examples/c2_gateway.py --config configs/c2-gateway-auto.ini
+```

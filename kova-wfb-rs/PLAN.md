@@ -181,6 +181,20 @@ frames during debugging.
   `node_to_c2` / `c2_to_node` payloads for prototype testing.
 - `mesh_txrx.py` can forward opaque C2 uplinks to an HTTP `/ingest` endpoint
   without decrypting them.
+- `c2_gateway.py` now provides a cleaner RX-only C2 bridge so normal mesh nodes
+  can keep running without cloud-forwarding logic in the same process.
+- `c2_gateway.py` can auto-detect a local running `mesh_txrx.py` process when
+  no gateway iface is configured, then open a second RX capture on that iface.
+- `mesh_txrx.py` can now accept localhost UDP control requests and originate
+  C2 uplinks from the normal hopping node process.
+- `c2_send.py` submits C2 uplink payloads to that local control port without
+  touching the radio.
+- `mesh_txrx.py` also emits opaque C2 uplink tap events over localhost so a
+  same-PC gateway can forward to cloud C2 without relying on RF self-capture.
+- `mesh_txrx.py` can periodically originate configured C2 uplink payloads
+  (`node N c2 test {counter}`) from the normal node process.
+- The C2 HTTP dashboard now displays the latest payload per node as one row per
+  origin node.
 - No ACK/retry/session example is implemented.
 
 ## Current Wire Visibility
@@ -972,6 +986,13 @@ Phase B - opaque C2 traffic:
 - implemented: add a small C2 HTTP server that decrypts uploaded
   `node_to_c2` payloads and displays them per node
 - implemented: add optional HTTP forwarding from `mesh_txrx.py` to C2 `/ingest`
+- implemented: add dedicated RX-only `c2_gateway.py` for RF-to-C2 forwarding
+- implemented: add gateway auto-iface discovery from a running mesh node
+- implemented: add local node control path for C2 uplink origination without a
+  second TX process
+- implemented: add localhost opaque C2 tap for same-PC C2 gateway forwarding
+- implemented: add periodic configured C2 uplink source in `mesh_txrx.py`
+- implemented: update C2 dashboard to render latest payload per node
 - current limitation: route metadata has E2E integrity but no separate outer hop
   authentication layer yet
 - next: deploy/run the C2 HTTP receiver on the UpCloud host and RF-test

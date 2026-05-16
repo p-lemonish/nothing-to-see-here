@@ -321,24 +321,54 @@ Then open:
 http://80.69.173.183:8080/
 ```
 
-A local RF C2/gateway listener can still be used when testing without the cloud:
+A dedicated RX-only RF gateway can bridge mesh C2 uplinks to the cloud without
+changing the normal node process. Edit `configs/c2-gateway.ini` with the
+gateway dongle iface, then run:
 
 ```bash
-# Edit configs/c2-local.ini iface first.
-sudo -E "$VIRTUAL_ENV/bin/python" python/examples/mesh_txrx.py --config configs/c2-local.ini
+sudo -E "$VIRTUAL_ENV/bin/python" python/examples/c2_gateway.py --config configs/c2-gateway.ini
 ```
 
-Stop the node 1 status process before reusing the same dongle, then send an
-opaque C2-bound datagram:
+If the gateway should reuse a node already running on the same PC, leave the
+gateway iface unset and use the auto config. The node shares opaque C2 uplinks
+over a localhost UDP tap, so the gateway does not depend on RF self-capture from
+the same adapter:
 
 ```bash
-sudo -E "$VIRTUAL_ENV/bin/python" python/examples/mesh_txrx.py \
+sudo -E "$VIRTUAL_ENV/bin/python" python/examples/c2_gateway.py --config configs/c2-gateway-auto.ini
+```
+
+The auto config listens on `127.0.0.1:17801`. The node configs send local C2
+tap events there while still transmitting the same opaque packet over RF.
+
+The normal mesh processes can keep running unchanged:
+
+```bash
+sudo -E "$VIRTUAL_ENV/bin/python" python/examples/mesh_txrx.py --config configs/node1.ini
+sudo -E "$VIRTUAL_ENV/bin/python" python/examples/mesh_txrx.py --config configs/node2.ini
+sudo -E "$VIRTUAL_ENV/bin/python" python/examples/mesh_txrx.py --config configs/node3.ini
+```
+
+If the gateway shares the exact same dongle with another process, avoid two
+processes fighting over channel changes. Either run the gateway with
+`--no-channel-agility` and let the mesh process own hopping, or use a dedicated
+gateway dongle.
+
+To originate an opaque C2-bound datagram from a node:
+
+```bash
+python/.venv/bin/python python/examples/c2_send.py \
   --config configs/node1.ini \
-  --traffic-class c2_uplink --message-type data \
-  --message "node 1 c2 test" --count 0 --tx-interval-ms 1000 \
-  --c2-http-forward-url http://80.69.173.183:8080/ingest
+  --message "node 1 c2 test"
 ```
 
-Relay nodes should log `RX opaque_route ... decrypt_skipped=1`. The matching
-C2/gateway endpoint should log `RX e2e ... decrypted=1 payload="..."`; the HTTP
-gateway path logs `HTTP c2_forward ... ok=1`.
+The running node keeps its normal channel agility and emits `TX route_v2 ...
+class=c2_uplink ... source=local_control`. Relay nodes should log
+`RX opaque_route ... decrypt_skipped=1`. The gateway logs `HTTP c2_forward ...
+ok=1`, and the cloud page shows the decrypted payload under the origin node.
+
+The node configs also include a `[c2_uplink]` section. When enabled, the normal
+`mesh_txrx.py --config configs/nodeN.ini` process periodically sends
+`node N c2 test {counter}` as an encrypted C2 uplink while continuing normal
+mesh status and channel hopping. The C2 dashboard shows one latest row per node,
+updated in place as the counter changes.

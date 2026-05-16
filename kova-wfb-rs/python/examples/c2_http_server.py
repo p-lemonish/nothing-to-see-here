@@ -6,7 +6,7 @@ import configparser
 import html
 import json
 import time
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -50,6 +50,7 @@ class C2EventStore:
         self._keyring = keyring
         self._max_events = max_events
         self._events: deque[dict[str, Any]] = deque()
+        self._latest_by_node: dict[int, dict[str, Any]] = {}
         self._seen: set[tuple[int, int, int, int, int, int]] = set()
         self._lock = Lock()
 
@@ -146,6 +147,7 @@ class C2EventStore:
 
             self._seen.add(dedupe_key)
             self._events.appendleft(event)
+            self._latest_by_node[origin_id] = event
             while len(self._events) > self._max_events:
                 old = self._events.pop()
                 self._seen.discard(
@@ -163,6 +165,13 @@ class C2EventStore:
     def events(self) -> list[dict[str, Any]]:
         with self._lock:
             return list(self._events)
+
+    def latest(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                self._latest_by_node[node_id]
+                for node_id in sorted(self._latest_by_node)
+            ]
 
 
 def _utc_ms() -> int:
@@ -268,11 +277,7 @@ def load_keyring(config_paths: list[str]) -> dict[tuple[int, int, int], C2Key]:
     return keyring
 
 
-def render_html(events: list[dict[str, Any]]) -> bytes:
-    grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
-    for event in events:
-        grouped[int(event["origin_id"])].append(event)
-
+def render_html(latest_events: list[dict[str, Any]]) -> bytes:
     parts = [
         "<!doctype html>",
         '<html lang="en">',
@@ -284,35 +289,35 @@ def render_html(events: list[dict[str, Any]]) -> bytes:
         "<style>",
         "body{font-family:system-ui,sans-serif;margin:24px;background:#f7f7f5;color:#151515}",
         "h1{font-size:24px;margin:0 0 16px}",
-        "h2{font-size:18px;margin:24px 0 8px}",
         "table{border-collapse:collapse;width:100%;background:white}",
         "th,td{border:1px solid #ddd;padding:6px 8px;text-align:left;font-size:14px}",
         "th{background:#eee}",
         "code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}",
+        ".payload{max-width:52rem;white-space:pre-wrap;word-break:break-word}",
         ".empty{color:#666}",
         "</style>",
         "</head>",
         "<body>",
         "<h1>Kova C2 Payloads</h1>",
     ]
-    if not events:
+    if not latest_events:
         parts.append('<p class="empty">No payloads received yet.</p>')
-    for node_id in sorted(grouped):
-        parts.append(f"<h2>Node {node_id}</h2>")
+    else:
         parts.append("<table>")
         parts.append(
-            "<tr><th>UTC ms</th><th>Seq</th><th>Type</th><th>Gateway</th>"
-            "<th>Key</th><th>Payload</th></tr>"
+            "<tr><th>Node</th><th>UTC ms</th><th>Seq</th><th>Type</th>"
+            "<th>Gateway</th><th>Key</th><th>Payload</th></tr>"
         )
-        for event in grouped[node_id][:50]:
+        for event in latest_events:
             parts.append(
                 "<tr>"
+                f"<td>{event['origin_id']}</td>"
                 f"<td>{event['received_at_ms']}</td>"
                 f"<td>{event['origin_seq']}</td>"
                 f"<td>{html.escape(str(event['inner_type']))}</td>"
                 f"<td>{html.escape(str(event.get('gateway_id')))}</td>"
                 f"<td>{event['key_id']}:{event['key_epoch']}</td>"
-                f"<td><code>{html.escape(str(event['payload_text']))}</code></td>"
+                f"<td class=\"payload\"><code>{html.escape(str(event['payload_text']))}</code></td>"
                 "</tr>"
             )
         parts.append("</table>")
@@ -326,11 +331,15 @@ def make_handler(store: C2EventStore):
 
         def do_GET(self) -> None:
             if self.path in {"/", "/index.html"}:
-                body = render_html(store.events())
+                body = render_html(store.latest())
                 self._send(HTTPStatus.OK, body, "text/html; charset=utf-8")
                 return
             if self.path == "/events":
                 body = json.dumps({"events": store.events()}, indent=2).encode("utf-8")
+                self._send(HTTPStatus.OK, body, "application/json")
+                return
+            if self.path == "/latest":
+                body = json.dumps({"nodes": store.latest()}, indent=2).encode("utf-8")
                 self._send(HTTPStatus.OK, body, "application/json")
                 return
             if self.path == "/health":

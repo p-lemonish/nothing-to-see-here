@@ -6,6 +6,7 @@ import configparser
 import json
 import os
 import secrets
+import socket
 import struct
 import subprocess
 import time
@@ -51,6 +52,7 @@ from wfb_rs_py.app_proto import (
     encode_secure_payload,
     encode_status_payload,
     encode_sync_payload,
+    message_type_name,
     message_type_value,
     security_domain_name,
     security_domain_value,
@@ -68,6 +70,9 @@ CONFIG_SECTION = "mesh"
 MESH_CRYPTO_SECTION = "mesh_crypto"
 C2_UPLINK_CRYPTO_SECTION = "c2_uplink_crypto"
 C2_DOWNLINK_CRYPTO_SECTION = "c2_downlink_crypto"
+C2_UPLINK_SECTION = "c2_uplink"
+LOCAL_CONTROL_SECTION = "local_control"
+LOCAL_C2_TAP_SECTION = "local_c2_tap"
 SECURE_ROUTE_AAD = struct.Struct("!4sBBBIBH")
 DEFAULT_C2_ID = 1
 LINK_STATE_NOMINAL = "nominal"
@@ -110,6 +115,15 @@ class LinkHealthTransition:
     reason: str
     inactive_ms: int
     active_peers: int
+
+
+@dataclass(frozen=True)
+class LocalC2Message:
+    inner_type: int
+    payload: bytes
+    destination_id: int
+    ttl: int
+    source: str
 
 
 class LinkHealthTracker:
@@ -451,6 +465,7 @@ def _load_config(path: str | None) -> dict[str, object]:
         "destination_type",
         "traffic_class",
         "c2_http_forward_url",
+        "local_control_bind_host",
         "message_type",
         "message",
         "message_file",
@@ -483,6 +498,8 @@ def _load_config(path: str | None) -> dict[str, object]:
         "link_move_after_ms",
         "link_rtb_after_ms",
         "link_recovery_hold_ms",
+        "local_control_bind_port",
+        "local_control_max_datagram_bytes",
     ):
         if key in section:
             out[key] = int(section[key], 0)
@@ -495,9 +512,46 @@ def _load_config(path: str | None) -> dict[str, object]:
         "sync_heartbeat",
         "message_file_reload",
         "status_auto",
+        "local_control_enabled",
     ):
         if key in section:
             out[key] = section.getboolean(key)
+
+    if parser.has_section(LOCAL_CONTROL_SECTION):
+        section = parser[LOCAL_CONTROL_SECTION]
+        if "enabled" in section:
+            out["local_control_enabled"] = section.getboolean("enabled")
+        if "bind_host" in section:
+            value = _optional_text(section.get("bind_host"))
+            if value is not None:
+                out["local_control_bind_host"] = value
+        for key in ("bind_port", "max_datagram_bytes"):
+            if key in section:
+                out[f"local_control_{key}"] = int(section[key], 0)
+
+    if parser.has_section(LOCAL_C2_TAP_SECTION):
+        section = parser[LOCAL_C2_TAP_SECTION]
+        if "enabled" in section:
+            out["local_c2_tap_enabled"] = section.getboolean("enabled")
+        if "target_host" in section:
+            value = _optional_text(section.get("target_host"))
+            if value is not None:
+                out["local_c2_tap_target_host"] = value
+        if "target_port" in section:
+            out["local_c2_tap_target_port"] = int(section["target_port"], 0)
+
+    if parser.has_section(C2_UPLINK_SECTION):
+        section = parser[C2_UPLINK_SECTION]
+        if "enabled" in section:
+            out["c2_uplink_enabled"] = section.getboolean("enabled")
+        for key in ("message_type", "message_template"):
+            if key in section:
+                value = _optional_text(section.get(key))
+                if value is not None:
+                    out[f"c2_uplink_{key}"] = value
+        for key in ("interval_ms", "destination_id", "ttl", "start_counter"):
+            if key in section:
+                out[f"c2_uplink_{key}"] = int(section[key], 0)
 
     if parser.has_section(MESH_CRYPTO_SECTION):
         section = parser[MESH_CRYPTO_SECTION]
@@ -839,6 +893,78 @@ def main() -> int:
         default=config_defaults.get("link_recovery_hold_ms", 5000),
         help="time spent in RECOVERY before returning to NOMINAL",
     )
+    parser.add_argument(
+        "--local-control",
+        action=argparse.BooleanOptionalAction,
+        default=config_defaults.get("local_control_enabled", False),
+        help="listen for localhost UDP commands that originate C2 uplink packets",
+    )
+    parser.add_argument(
+        "--local-control-bind-host",
+        default=config_defaults.get("local_control_bind_host", "127.0.0.1"),
+    )
+    parser.add_argument(
+        "--local-control-bind-port",
+        type=int,
+        default=config_defaults.get("local_control_bind_port", 0),
+    )
+    parser.add_argument(
+        "--local-control-max-datagram-bytes",
+        type=int,
+        default=config_defaults.get("local_control_max_datagram_bytes", 8192),
+    )
+    parser.add_argument(
+        "--local-c2-tap",
+        action=argparse.BooleanOptionalAction,
+        default=config_defaults.get("local_c2_tap_enabled", False),
+        help="send opaque c2_uplink route_v2 packets to a localhost gateway tap",
+    )
+    parser.add_argument(
+        "--local-c2-tap-target-host",
+        default=config_defaults.get("local_c2_tap_target_host", "127.0.0.1"),
+    )
+    parser.add_argument(
+        "--local-c2-tap-target-port",
+        type=int,
+        default=config_defaults.get("local_c2_tap_target_port", 0),
+    )
+    parser.add_argument(
+        "--c2-uplink",
+        action=argparse.BooleanOptionalAction,
+        default=config_defaults.get("c2_uplink_enabled", False),
+        help="periodically originate node_to_c2 payloads from this normal mesh node",
+    )
+    parser.add_argument(
+        "--c2-uplink-interval-ms",
+        type=int,
+        default=config_defaults.get("c2_uplink_interval_ms", 1000),
+    )
+    parser.add_argument(
+        "--c2-uplink-message-template",
+        default=config_defaults.get(
+            "c2_uplink_message_template",
+            "node {sender_id} c2 test {counter}",
+        ),
+    )
+    parser.add_argument(
+        "--c2-uplink-message-type",
+        default=config_defaults.get("c2_uplink_message_type", "data"),
+    )
+    parser.add_argument(
+        "--c2-uplink-destination-id",
+        type=lambda value: int(value, 0),
+        default=config_defaults.get("c2_uplink_destination_id", DEFAULT_C2_ID),
+    )
+    parser.add_argument(
+        "--c2-uplink-ttl",
+        type=lambda value: int(value, 0),
+        default=config_defaults.get("c2_uplink_ttl", 2),
+    )
+    parser.add_argument(
+        "--c2-uplink-start-counter",
+        type=lambda value: int(value, 0),
+        default=config_defaults.get("c2_uplink_start_counter", 1),
+    )
     args = parser.parse_args()
 
     if not args.iface:
@@ -940,6 +1066,24 @@ def main() -> int:
         parser.error("--link-rtb-after-ms must be > --link-move-after-ms")
     if args.link_recovery_hold_ms < 0:
         parser.error("--link-recovery-hold-ms must be >= 0")
+    if args.local_control:
+        if not 1 <= args.local_control_bind_port <= 65535:
+            parser.error(
+                "--local-control-bind-port must be in range 1..65535 when enabled"
+            )
+        if args.local_control_max_datagram_bytes < 256:
+            parser.error("--local-control-max-datagram-bytes must be >= 256")
+    if args.local_c2_tap and not 1 <= args.local_c2_tap_target_port <= 65535:
+        parser.error("--local-c2-tap-target-port must be in range 1..65535")
+    if args.c2_uplink:
+        if args.c2_uplink_interval_ms <= 0:
+            parser.error("--c2-uplink-interval-ms must be > 0")
+        if not 1 <= args.c2_uplink_destination_id <= 255:
+            parser.error("--c2-uplink-destination-id must be in range 1..255")
+        if not 0 <= args.c2_uplink_ttl <= 255:
+            parser.error("--c2-uplink-ttl must be in range 0..255")
+        if args.c2_uplink_start_counter < 0:
+            parser.error("--c2-uplink-start-counter must be >= 0")
 
     try:
         inner_type = message_type_value(args.message_type)
@@ -951,6 +1095,13 @@ def main() -> int:
         parser.error("--message-type sync is reserved for --sync-heartbeat")
     if args.message_file is not None and inner_type != MSG_DATA:
         parser.error("--message-file requires --message-type=data")
+
+    try:
+        c2_uplink_inner_type = message_type_value(args.c2_uplink_message_type)
+    except AppFrameError as exc:
+        parser.error(f"--c2-uplink-message-type: {exc}")
+    if c2_uplink_inner_type in {MSG_ROUTE_DATA, MSG_ROUTE_V2, MSG_SYNC}:
+        parser.error("--c2-uplink-message-type is not allowed")
 
     mesh_crypto_enabled = bool(config_defaults.get("mesh_crypto_enabled", False))
     mesh_replay_window = int(config_defaults.get("mesh_crypto_replay_window", 4096))
@@ -1114,9 +1265,15 @@ def main() -> int:
             parser.error(
                 "traffic_class=c2_downlink requires [c2_downlink_crypto] enabled=true"
             )
+    if args.local_control and c2_uplink_crypto is None:
+        parser.error("[local_control] requires [c2_uplink_crypto] enabled=true")
+    if args.c2_uplink and c2_uplink_crypto is None:
+        parser.error("[c2_uplink] requires [c2_uplink_crypto] enabled=true")
 
     seen = SeenRoutes(args.seen_limit)
     secure_replay = ReplayWindow(mesh_replay_window)
+    pending_local_c2: Deque[LocalC2Message] = deque()
+    c2_uplink_counter = int(args.c2_uplink_start_counter)
     message_file_path = Path(args.message_file) if args.message_file is not None else None
 
     def read_message_file(path: Path) -> bytes:
@@ -1164,15 +1321,102 @@ def main() -> int:
     next_rf_seq = 1
     originated_count = 0
     next_tx_at = time.monotonic()
+    next_c2_uplink_at = time.monotonic()
     next_sync_at = time.monotonic()
     tx_guard_until = 0.0
     current_channel: int | None = None
     tx: Tx | None = None
     rx: Rx | None = None
+    local_control_socket: socket.socket | None = None
+    local_c2_tap_socket: socket.socket | None = None
 
     def log(message: str) -> None:
         channel = "?" if current_channel is None else str(current_channel)
         print(f"CH={channel} {message}")
+
+    def decode_local_c2_message(data: bytes, source: str) -> LocalC2Message:
+        try:
+            request = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AppFrameError("local control datagram must be a JSON object") from exc
+        if not isinstance(request, dict):
+            raise AppFrameError("local control datagram must be a JSON object")
+
+        request_traffic_class = traffic_class_value(
+            request.get("traffic_class", "c2_uplink")
+        )
+        if request_traffic_class != TRAFFIC_C2_UPLINK:
+            raise AppFrameError("local control currently supports only c2_uplink")
+
+        request_destination_type = address_type_value(
+            request.get("destination_type", "c2")
+        )
+        if request_destination_type != ADDR_C2:
+            raise AppFrameError("local control c2_uplink requires destination_type=c2")
+
+        request_inner_type = message_type_value(request.get("message_type", "data"))
+        if request_inner_type in {MSG_ROUTE_DATA, MSG_ROUTE_V2, MSG_SYNC}:
+            raise AppFrameError("local control message_type is not allowed")
+
+        payload_hex = request.get("payload_hex")
+        if payload_hex is not None:
+            if not isinstance(payload_hex, str):
+                raise AppFrameError("payload_hex must be a string")
+            try:
+                payload = bytes.fromhex(payload_hex)
+            except ValueError as exc:
+                raise AppFrameError("payload_hex must be valid hex") from exc
+        else:
+            message = request.get("message")
+            if not isinstance(message, str):
+                raise AppFrameError("local control requires message or payload_hex")
+            payload = message.encode("utf-8")
+
+        if len(payload) > MAX_U16:
+            raise AppFrameError(f"local control payload too large: {len(payload)}")
+
+        destination = int(request.get("destination_id", args.c2_id))
+        if not 1 <= destination <= 255:
+            raise AppFrameError("destination_id must be in range 1..255")
+        ttl = int(request.get("ttl", args.ttl))
+        if not 0 <= ttl <= 255:
+            raise AppFrameError("ttl must be in range 0..255")
+
+        return LocalC2Message(
+            inner_type=request_inner_type,
+            payload=payload,
+            destination_id=destination,
+            ttl=ttl,
+            source=source,
+        )
+
+    def drain_local_control_socket() -> None:
+        if local_control_socket is None:
+            return
+        while True:
+            try:
+                data, peer = local_control_socket.recvfrom(
+                    args.local_control_max_datagram_bytes
+                )
+            except BlockingIOError:
+                return
+            except OSError as exc:
+                log(f'LOCAL_CONTROL recv_error="{exc}"')
+                return
+
+            source = f"{peer[0]}:{peer[1]}"
+            try:
+                message = decode_local_c2_message(data, source)
+            except (AppFrameError, ValueError) as exc:
+                log(f'LOCAL_CONTROL reject from={source} error="{exc}"')
+                continue
+            pending_local_c2.append(message)
+            log(
+                f"LOCAL_CONTROL queued from={source} "
+                f"type={message_type_name(message.inner_type)} "
+                f"dest=c2:{message.destination_id} ttl={message.ttl} "
+                f"len={len(message.payload)} pending={len(pending_local_c2)}"
+            )
 
     def status_flags(now: float) -> int:
         flags = STATUS_FLAG_FORWARDING_ENABLED
@@ -1204,6 +1448,18 @@ def main() -> int:
             return read_message_file(message_file_path)
         return static_inner_payload
 
+    def build_c2_uplink_payload(counter: int) -> bytes:
+        text = args.c2_uplink_message_template.format(
+            counter=counter,
+            sender_id=args.sender_id,
+            node_id=args.sender_id,
+            utc_ms=_utc_ms(),
+        )
+        payload = text.encode("utf-8")
+        if len(payload) > MAX_U16:
+            raise ValueError(f"c2 uplink payload too large: {len(payload)}")
+        return payload
+
     def close_radio() -> None:
         nonlocal tx, rx
         if rx is not None:
@@ -1212,6 +1468,41 @@ def main() -> int:
         if tx is not None:
             tx.close()
             tx = None
+
+    def open_local_control() -> None:
+        nonlocal local_control_socket
+        if not args.local_control:
+            return
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind((args.local_control_bind_host, args.local_control_bind_port))
+        sock.setblocking(False)
+        local_control_socket = sock
+        log(
+            f"LOCAL_CONTROL listening "
+            f"addr={args.local_control_bind_host}:{args.local_control_bind_port}"
+        )
+
+    def close_local_control() -> None:
+        nonlocal local_control_socket
+        if local_control_socket is not None:
+            local_control_socket.close()
+            local_control_socket = None
+
+    def open_local_c2_tap() -> None:
+        nonlocal local_c2_tap_socket
+        if not args.local_c2_tap:
+            return
+        local_c2_tap_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        log(
+            f"LOCAL_C2_TAP target="
+            f"{args.local_c2_tap_target_host}:{args.local_c2_tap_target_port}"
+        )
+
+    def close_local_c2_tap() -> None:
+        nonlocal local_c2_tap_socket
+        if local_c2_tap_socket is not None:
+            local_c2_tap_socket.close()
+            local_c2_tap_socket = None
 
     def open_radio() -> None:
         nonlocal tx, rx
@@ -1426,13 +1717,8 @@ def main() -> int:
             raise AppFrameError("secure replay detected")
         return plaintext, secure
 
-    def post_c2_upload(route) -> tuple[bool, str]:
-        if args.c2_http_forward_url is None:
-            return False, "disabled"
-        if route.traffic_class != TRAFFIC_C2_UPLINK or route.destination_type != ADDR_C2:
-            return False, "not_c2_uplink"
-
-        upload = {
+    def build_c2_upload(route) -> dict[str, object]:
+        return {
             "gateway_id": args.sender_id,
             "channel": current_channel,
             "received_at_ms": _utc_ms(),
@@ -1448,7 +1734,38 @@ def main() -> int:
                 "inner_payload_hex": route.inner_payload.hex(),
             },
         }
-        body = json.dumps(upload, separators=(",", ":")).encode("utf-8")
+
+    def emit_local_c2_tap(route, *, reason: str) -> None:
+        if local_c2_tap_socket is None:
+            return
+        if route.traffic_class != TRAFFIC_C2_UPLINK or route.destination_type != ADDR_C2:
+            return
+
+        body = json.dumps(build_c2_upload(route), separators=(",", ":")).encode("utf-8")
+        try:
+            local_c2_tap_socket.sendto(
+                body,
+                (args.local_c2_tap_target_host, args.local_c2_tap_target_port),
+            )
+        except OSError as exc:
+            log(
+                f'LOCAL_C2_TAP send_error origin={route.origin_id} '
+                f'seq={route.origin_seq} reason={reason} error="{exc}"'
+            )
+            return
+        log(
+            f"LOCAL_C2_TAP sent origin={route.origin_id} "
+            f"seq={route.origin_seq} dest=c2:{route.destination_id} "
+            f"reason={reason} bytes={len(body)}"
+        )
+
+    def post_c2_upload(route) -> tuple[bool, str]:
+        if args.c2_http_forward_url is None:
+            return False, "disabled"
+        if route.traffic_class != TRAFFIC_C2_UPLINK or route.destination_type != ADDR_C2:
+            return False, "not_c2_uplink"
+
+        body = json.dumps(build_c2_upload(route), separators=(",", ":")).encode("utf-8")
         request = urllib.request.Request(
             args.c2_http_forward_url,
             data=body,
@@ -1609,6 +1926,8 @@ def main() -> int:
             )
         else:
             open_radio()
+        open_local_control()
+        open_local_c2_tap()
 
         hop_desc = ",".join(str(channel) for channel in hop_channels)
         agility_desc = f" agility={hop_desc}" if args.channel_agility else ""
@@ -1656,6 +1975,7 @@ def main() -> int:
             if tx is None or rx is None:
                 raise RuntimeError("radio handles are not open")
 
+            drain_local_control_socket()
             now = time.monotonic()
             transition = link_health.evaluate(now)
             if transition is not None:
@@ -1671,6 +1991,104 @@ def main() -> int:
                 log(f'PAYLOAD source_error="{exc}"')
                 next_tx_at = now + (args.tx_interval_ms / 1000.0)
                 origin_payload = None
+            should_send_c2_uplink = (
+                args.c2_uplink
+                and now >= next_c2_uplink_at
+                and tx_allowed
+            )
+            if should_send_c2_uplink:
+                try:
+                    c2_payload = build_c2_uplink_payload(c2_uplink_counter)
+                    sent_seq, e2e_crypto, sent_route = send_route_v2(
+                        inner_type=c2_uplink_inner_type,
+                        payload=c2_payload,
+                        destination_type=ADDR_C2,
+                        destination_id=args.c2_uplink_destination_id,
+                        ttl=args.c2_uplink_ttl,
+                        traffic_class=TRAFFIC_C2_UPLINK,
+                    )
+                except (AppFrameError, ValueError, KeyError) as exc:
+                    log(f'C2_UPLINK send_error counter={c2_uplink_counter} error="{exc}"')
+                else:
+                    log(
+                        f"TX e2e origin={_addr_label(origin_type, args.sender_id)} "
+                        f"seq={sent_seq} "
+                        f"dest={_addr_label(ADDR_C2, args.c2_uplink_destination_id)} "
+                        f"class={traffic_class_name(TRAFFIC_C2_UPLINK)} "
+                        f"domain={security_domain_name(e2e_crypto.security_domain)} "
+                        f"key_id={e2e_crypto.key_id} "
+                        f"key_epoch={e2e_crypto.key_epoch} "
+                        f"len={len(c2_payload)} source=c2_uplink "
+                        f"counter={c2_uplink_counter}"
+                    )
+                    log(
+                        f"TX route_v2 "
+                        f"origin={_addr_label(origin_type, args.sender_id)} "
+                        f"seq={sent_seq} "
+                        f"dest={_addr_label(ADDR_C2, args.c2_uplink_destination_id)} "
+                        f"ttl={args.c2_uplink_ttl} "
+                        f"class={traffic_class_name(TRAFFIC_C2_UPLINK)} "
+                        f"type={message_type_name(c2_uplink_inner_type)} "
+                        f"len={len(c2_payload)} e2e=1 source=c2_uplink "
+                        f"counter={c2_uplink_counter}"
+                    )
+                    emit_local_c2_tap(sent_route, reason="c2_uplink")
+                    if args.c2_http_forward_url is not None:
+                        ok, detail = post_c2_upload(sent_route)
+                        log(
+                            f"HTTP c2_forward origin={sent_route.origin_id} "
+                            f"seq={sent_route.origin_seq} "
+                            f"dest={_addr_label(sent_route.destination_type, sent_route.destination_id)} "
+                            f"ok={int(ok)} detail=\"{detail}\""
+                        )
+                    c2_uplink_counter += 1
+                next_c2_uplink_at = now + (args.c2_uplink_interval_ms / 1000.0)
+            if pending_local_c2 and tx_allowed:
+                control = pending_local_c2.popleft()
+                try:
+                    sent_seq, e2e_crypto, sent_route = send_route_v2(
+                        inner_type=control.inner_type,
+                        payload=control.payload,
+                        destination_type=ADDR_C2,
+                        destination_id=control.destination_id,
+                        ttl=control.ttl,
+                        traffic_class=TRAFFIC_C2_UPLINK,
+                    )
+                except AppFrameError as exc:
+                    log(
+                        f'LOCAL_CONTROL send_error source={control.source} '
+                        f'error="{exc}"'
+                    )
+                else:
+                    log(
+                        f"TX e2e origin={_addr_label(origin_type, args.sender_id)} "
+                        f"seq={sent_seq} "
+                        f"dest={_addr_label(ADDR_C2, control.destination_id)} "
+                        f"class={traffic_class_name(TRAFFIC_C2_UPLINK)} "
+                        f"domain={security_domain_name(e2e_crypto.security_domain)} "
+                        f"key_id={e2e_crypto.key_id} "
+                        f"key_epoch={e2e_crypto.key_epoch} "
+                        f"len={len(control.payload)} source=local_control"
+                    )
+                    log(
+                        f"TX route_v2 "
+                        f"origin={_addr_label(origin_type, args.sender_id)} "
+                        f"seq={sent_seq} "
+                        f"dest={_addr_label(ADDR_C2, control.destination_id)} "
+                        f"ttl={control.ttl} "
+                        f"class={traffic_class_name(TRAFFIC_C2_UPLINK)} "
+                        f"type={message_type_name(control.inner_type)} "
+                        f"len={len(control.payload)} e2e=1 source=local_control"
+                    )
+                    emit_local_c2_tap(sent_route, reason="local_control")
+                    if args.c2_http_forward_url is not None:
+                        ok, detail = post_c2_upload(sent_route)
+                        log(
+                            f"HTTP c2_forward origin={sent_route.origin_id} "
+                            f"seq={sent_route.origin_seq} "
+                            f"dest={_addr_label(sent_route.destination_type, sent_route.destination_id)} "
+                            f"ok={int(ok)} detail=\"{detail}\""
+                        )
             should_originate = (
                 origin_payload is not None
                 and (args.count == 0 or originated_count < args.count)
@@ -1706,6 +2124,7 @@ def main() -> int:
                         f"type={args.message_type} len={len(origin_payload)} "
                         "e2e=1"
                     )
+                    emit_local_c2_tap(sent_route, reason="originated")
                     if (
                         args.c2_http_forward_url is not None
                         and sent_route.traffic_class == TRAFFIC_C2_UPLINK
@@ -1881,6 +2300,7 @@ def main() -> int:
                         f"seq={route_v2.origin_seq} dest={dest_label} "
                         f"ok={int(ok)} detail=\"{detail}\""
                     )
+                emit_local_c2_tap(route_v2, reason="received")
 
                 if route_v2.ttl <= 0:
                     continue
@@ -2097,6 +2517,8 @@ def main() -> int:
     except KeyboardInterrupt:
         return 130
     finally:
+        close_local_c2_tap()
+        close_local_control()
         close_radio()
 
 

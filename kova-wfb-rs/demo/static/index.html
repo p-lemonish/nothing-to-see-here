@@ -1,0 +1,817 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Drone Mesh Dashboard</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f5f7f8;
+        --panel: #ffffff;
+        --panel-soft: #edf1f4;
+        --ink: #1f252b;
+        --muted: #68727f;
+        --line: #d7dde3;
+        --online: #168a55;
+        --stale: #c98212;
+        --down: #c84b4b;
+        --radio: #2f6fb2;
+        --sim: #7a5bbd;
+        --base: #20262d;
+        --shadow: 0 18px 50px rgba(32, 38, 45, 0.09);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        overflow: hidden;
+        background: var(--bg);
+        color: var(--ink);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+      }
+
+      button,
+      input {
+        font: inherit;
+      }
+
+      .app {
+        height: 100vh;
+        min-height: 0;
+        display: grid;
+        grid-template-rows: auto 1fr;
+      }
+
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px;
+        padding: 18px 22px 14px;
+        border-bottom: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.92);
+        backdrop-filter: blur(12px);
+      }
+
+      .title-block {
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+        min-width: 260px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 20px;
+        line-height: 1.1;
+        letter-spacing: 0;
+      }
+
+      .subtitle {
+        color: var(--muted);
+        font-size: 13px;
+        white-space: nowrap;
+      }
+
+      .stats {
+        display: grid;
+        grid-auto-flow: column;
+        grid-auto-columns: minmax(96px, auto);
+        gap: 10px;
+      }
+
+      .stat {
+        min-height: 50px;
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        background: var(--panel);
+      }
+
+      .stat span {
+        display: block;
+        color: var(--muted);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+
+      .stat strong {
+        display: block;
+        margin-top: 3px;
+        font-size: 18px;
+        line-height: 1.1;
+      }
+
+      main {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 360px;
+        min-height: 0;
+        overflow: hidden;
+      }
+
+      .map-wrap {
+        position: relative;
+        min-height: 0;
+        overflow: hidden;
+        background:
+          linear-gradient(rgba(31, 37, 43, 0.06) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(31, 37, 43, 0.06) 1px, transparent 1px),
+          #f9fafb;
+        background-size: 44px 44px;
+      }
+
+      .map-toolbar {
+        position: absolute;
+        z-index: 4;
+        left: 18px;
+        top: 18px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.9);
+        box-shadow: var(--shadow);
+      }
+
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        min-height: 30px;
+        padding: 5px 9px;
+        border: 1px solid var(--line);
+        background: var(--panel);
+        color: var(--ink);
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 999px;
+        background: var(--muted);
+      }
+
+      .dot.online {
+        background: var(--online);
+      }
+
+      .dot.stale {
+        background: var(--stale);
+      }
+
+      .dot.down {
+        background: var(--down);
+      }
+
+      svg {
+        display: block;
+        width: 100%;
+        height: 100%;
+        min-height: 0;
+      }
+
+      .range-ring {
+        fill: none;
+        stroke: rgba(47, 111, 178, 0.16);
+        stroke-width: 2;
+      }
+
+      .mesh-link {
+        stroke: var(--radio);
+        stroke-width: 3;
+        stroke-linecap: round;
+        opacity: 0.78;
+      }
+
+      .mesh-link.stale {
+        stroke: var(--stale);
+        stroke-dasharray: 8 8;
+      }
+
+      .mesh-link.down {
+        stroke: var(--down);
+        stroke-dasharray: 3 9;
+        opacity: 0.28;
+      }
+
+      .node-hit {
+        fill: transparent;
+      }
+
+      .node-core {
+        stroke: #fff;
+        stroke-width: 4;
+        filter: drop-shadow(0 9px 16px rgba(31, 37, 43, 0.18));
+      }
+
+      .node-core.online {
+        fill: var(--online);
+      }
+
+      .node-core.stale {
+        fill: var(--stale);
+      }
+
+      .node-core.down {
+        fill: var(--down);
+      }
+
+      .node-core.base {
+        fill: var(--base);
+      }
+
+      .node-label {
+        fill: var(--ink);
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0;
+        paint-order: stroke;
+        stroke: rgba(249, 250, 251, 0.9);
+        stroke-width: 5px;
+        stroke-linejoin: round;
+      }
+
+      .node-sub {
+        fill: var(--muted);
+        font-size: 11px;
+        letter-spacing: 0;
+        paint-order: stroke;
+        stroke: rgba(249, 250, 251, 0.9);
+        stroke-width: 4px;
+      }
+
+      aside {
+        min-height: 0;
+        border-left: 1px solid var(--line);
+        background: var(--panel);
+        display: grid;
+        grid-template-rows: auto 1fr;
+      }
+
+      .sidebar-tabs {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 6px;
+        padding: 10px;
+        border-bottom: 1px solid var(--line);
+        background: #fff;
+      }
+
+      .sidebar-tab {
+        min-height: 36px;
+        border: 1px solid var(--line);
+        background: var(--panel-soft);
+        color: var(--ink);
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      .sidebar-tab[aria-selected="true"] {
+        border-color: var(--ink);
+        background: var(--ink);
+        color: #fff;
+      }
+
+      .sidebar-tab:focus-visible {
+        outline: 2px solid var(--radio);
+        outline-offset: 2px;
+      }
+
+      .sidebar-page {
+        min-height: 0;
+        overflow: auto;
+      }
+
+      .sidebar-page[hidden] {
+        display: none;
+      }
+
+      .panel-section {
+        padding: 16px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .section-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+
+      h2 {
+        margin: 0;
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        color: var(--muted);
+      }
+
+      .toggles {
+        display: grid;
+        gap: 8px;
+      }
+
+      .toggle-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        min-height: 38px;
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        background: #fbfcfd;
+      }
+
+      .toggle-row label {
+        color: var(--ink);
+        font-size: 13px;
+        font-weight: 650;
+      }
+
+      .toggle-row input {
+        width: 42px;
+        height: 22px;
+        accent-color: var(--down);
+      }
+
+      .reset-btn {
+        border: 1px solid var(--line);
+        background: var(--panel-soft);
+        color: var(--ink);
+        min-height: 32px;
+        padding: 6px 10px;
+        cursor: pointer;
+      }
+
+      .node-list {
+        display: grid;
+        gap: 8px;
+      }
+
+      .node-row {
+        display: grid;
+        grid-template-columns: 12px 1fr auto;
+        align-items: center;
+        gap: 10px;
+        min-height: 54px;
+        padding: 10px;
+        border: 1px solid var(--line);
+        background: #fbfcfd;
+      }
+
+      .node-row .name {
+        font-weight: 700;
+        font-size: 13px;
+        line-height: 1.15;
+      }
+
+      .node-row .meta {
+        margin-top: 4px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.2;
+        overflow-wrap: anywhere;
+      }
+
+      .badge {
+        justify-self: end;
+        min-width: 62px;
+        padding: 4px 6px;
+        border: 1px solid var(--line);
+        color: var(--muted);
+        background: #fff;
+        text-align: center;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+
+      .events {
+        min-height: 0;
+        overflow: auto;
+        border-bottom: 0;
+      }
+
+      .event-list {
+        display: grid;
+        gap: 6px;
+        padding-bottom: 10px;
+      }
+
+      .event {
+        padding: 8px 0;
+        border-bottom: 1px solid var(--line);
+        font-size: 12px;
+        line-height: 1.35;
+      }
+
+      .event strong {
+        font-weight: 700;
+      }
+
+      .event .time {
+        display: block;
+        margin-top: 2px;
+        color: var(--muted);
+      }
+
+      .payload {
+        display: block;
+        margin-top: 6px;
+        padding: 7px 8px;
+        max-height: 74px;
+        overflow: auto;
+        border: 1px solid var(--line);
+        background: #f7f9fb;
+        color: #2f3943;
+        font-family:
+          ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+          monospace;
+        font-size: 11px;
+        line-height: 1.35;
+        overflow-wrap: anywhere;
+      }
+
+      @media (max-width: 940px) {
+        body {
+          overflow: auto;
+        }
+
+        .app {
+          height: auto;
+          min-height: 100vh;
+        }
+
+        header {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+
+        .stats {
+          width: 100%;
+          grid-auto-flow: row;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        main {
+          grid-template-columns: 1fr;
+          overflow: visible;
+        }
+
+        .map-wrap {
+          min-height: 520px;
+        }
+
+        svg {
+          min-height: 520px;
+        }
+
+        aside {
+          border-left: 0;
+          border-top: 1px solid var(--line);
+        }
+      }
+
+      @media (max-width: 560px) {
+        .title-block {
+          min-width: 0;
+          display: grid;
+          gap: 4px;
+        }
+
+        .subtitle {
+          white-space: normal;
+        }
+
+        .stats {
+          grid-template-columns: 1fr;
+        }
+
+        .map-toolbar {
+          left: 10px;
+          right: 10px;
+          flex-wrap: wrap;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <header>
+        <div class="title-block">
+          <h1>Drone Mesh Dashboard</h1>
+          <div class="subtitle" id="connectionText">Connecting</div>
+        </div>
+        <div class="stats">
+          <div class="stat"><span>Online</span><strong id="onlineCount">0</strong></div>
+          <div class="stat"><span>Radio RX</span><strong id="radioPackets">0</strong></div>
+          <div class="stat"><span>Channel</span><strong id="channelStat">fixed</strong></div>
+          <div class="stat"><span>Packet Loss</span><strong id="lossRate">0%</strong></div>
+          <div class="stat"><span>Uptime</span><strong id="uptime">0s</strong></div>
+        </div>
+      </header>
+      <main>
+        <section class="map-wrap">
+          <div class="map-toolbar">
+            <span class="pill"><span class="dot online"></span>Online</span>
+            <span class="pill"><span class="dot stale"></span>Stale</span>
+            <span class="pill"><span class="dot down"></span>Down</span>
+          </div>
+          <svg id="meshSvg" viewBox="0 0 1000 680" role="img" aria-label="Drone mesh map"></svg>
+        </section>
+        <aside>
+          <div class="sidebar-tabs" role="tablist" aria-label="Sidebar pages">
+            <button class="sidebar-tab" id="tab-nodes" role="tab" aria-selected="true" aria-controls="page-nodes" data-page="nodes">
+              Nodes
+            </button>
+            <button class="sidebar-tab" id="tab-data" role="tab" aria-selected="false" aria-controls="page-data" data-page="data" tabindex="-1">
+              Data
+            </button>
+          </div>
+          <div class="sidebar-page" id="page-nodes" role="tabpanel" aria-labelledby="tab-nodes" data-page="nodes">
+            <section class="panel-section" id="jamPanel">
+              <div class="section-head">
+                <h2>Jamming</h2>
+                <button class="reset-btn" id="resetJam">Clear</button>
+              </div>
+              <div class="toggles" id="jamToggles"></div>
+            </section>
+            <section class="panel-section">
+              <div class="section-head">
+                <h2>Transmitters</h2>
+                <span class="badge" id="sourceBadge">source</span>
+              </div>
+              <div class="node-list" id="nodeList"></div>
+            </section>
+          </div>
+          <div class="sidebar-page" id="page-data" role="tabpanel" aria-labelledby="tab-data" data-page="data" hidden>
+            <section class="panel-section events">
+              <div class="section-head">
+                <h2>Received Data</h2>
+              </div>
+              <div class="event-list" id="eventList"></div>
+            </section>
+          </div>
+        </aside>
+      </main>
+    </div>
+
+    <script>
+      const svg = document.getElementById("meshSvg");
+      const nodeList = document.getElementById("nodeList");
+      const eventList = document.getElementById("eventList");
+      const jamToggles = document.getElementById("jamToggles");
+      const connectionText = document.getElementById("connectionText");
+      const onlineCount = document.getElementById("onlineCount");
+      const radioPackets = document.getElementById("radioPackets");
+      const channelStat = document.getElementById("channelStat");
+      const lossRate = document.getElementById("lossRate");
+      const uptime = document.getElementById("uptime");
+      const sourceBadge = document.getElementById("sourceBadge");
+      const resetJam = document.getElementById("resetJam");
+      const jamPanel = document.getElementById("jamPanel");
+      const sidebarTabs = document.querySelectorAll(".sidebar-tab");
+      const sidebarPages = document.querySelectorAll(".sidebar-page");
+
+      let latest = null;
+
+      function setSidebarPage(page) {
+        for (const tab of sidebarTabs) {
+          const isSelected = tab.dataset.page === page;
+          tab.setAttribute("aria-selected", String(isSelected));
+          tab.tabIndex = isSelected ? 0 : -1;
+        }
+
+        for (const panel of sidebarPages) {
+          panel.hidden = panel.dataset.page !== page;
+        }
+      }
+
+      function fmtAge(ms) {
+        if (ms === null || ms === undefined) return "never";
+        if (ms < 1000) return `${ms} ms`;
+        return `${(ms / 1000).toFixed(1)} s`;
+      }
+
+      function fmtRssi(value) {
+        return value === null || value === undefined ? "n/a" : `${value} dBm`;
+      }
+
+      function xy(node) {
+        return {
+          x: Math.round(70 + node.x * 860),
+          y: Math.round(54 + node.y * 560),
+        };
+      }
+
+      function stateDot(state) {
+        return `<span class="dot ${state}"></span>`;
+      }
+
+      function render(snapshot) {
+        latest = snapshot;
+        const nodes = snapshot.nodes || [];
+        const links = snapshot.links || [];
+        const nodeById = new Map(nodes.map((node) => [node.id, node]));
+        const drones = nodes.filter((node) => node.role !== "base");
+        const online = drones.filter((node) => node.state === "online").length;
+        const lost = drones.reduce((sum, node) => sum + (node.lost_packets || 0), 0);
+        const packets = drones.reduce((sum, node) => sum + (node.packets || 0), 0);
+
+        onlineCount.textContent = `${online}/${drones.length}`;
+        radioPackets.textContent = snapshot.stats.radio_packets;
+        channelStat.textContent = snapshot.stats.radio_channel ? String(snapshot.stats.radio_channel) : "fixed";
+        lossRate.textContent = packets + lost > 0 ? `${Math.round((lost / (packets + lost)) * 100)}%` : "0%";
+        uptime.textContent = `${Math.round(snapshot.stats.uptime_s)}s`;
+        sourceBadge.textContent = snapshot.stats.source;
+
+        const radioStatus = snapshot.stats.radio_error || snapshot.stats.radio_status;
+        const hop = snapshot.stats.radio_channel
+          ? ` | ch ${snapshot.stats.radio_channel} | next hop ${Math.round((snapshot.stats.radio_next_hop_ms || 0) / 1000)}s`
+          : "";
+        connectionText.textContent = `Source ${snapshot.stats.source} | radio ${radioStatus}${hop}`;
+
+        renderSvg(nodes, links, nodeById);
+        renderNodes(drones);
+        renderEvents(snapshot.events || []);
+        renderJamToggles(localSimNodes(drones, snapshot.stats.source), new Set(snapshot.jammed || []));
+      }
+
+      function localSimNodes(nodes, source) {
+        return nodes.filter((node) => node.source === "sim" || (source === "sim" && node.source === "config"));
+      }
+
+      function renderSvg(nodes, links, nodeById) {
+        const parts = [];
+        const base = nodes.find((node) => node.role === "base");
+        if (base) {
+          const p = xy(base);
+          parts.push(`<circle class="range-ring" cx="${p.x}" cy="${p.y}" r="190"></circle>`);
+          parts.push(`<circle class="range-ring" cx="${p.x}" cy="${p.y}" r="310"></circle>`);
+        }
+
+        for (const link of links) {
+          const from = nodeById.get(link.from);
+          const to = nodeById.get(link.to);
+          if (!from || !to) continue;
+          const a = xy(from);
+          const b = xy(to);
+          const ageOpacity = Math.max(0.18, 1 - (link.age_ms || 0) / 12000);
+          parts.push(
+            `<line class="mesh-link ${link.state}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" style="opacity:${ageOpacity.toFixed(2)}"></line>`
+          );
+          const midX = Math.round((a.x + b.x) / 2);
+          const midY = Math.round((a.y + b.y) / 2);
+          const label = link.rssi === null || link.rssi === undefined ? `${link.packets}` : `${link.rssi} dBm`;
+          parts.push(`<text class="node-sub" x="${midX + 8}" y="${midY - 8}">${label}</text>`);
+        }
+
+        for (const node of nodes) {
+          const p = xy(node);
+          const state = node.role === "base" ? "base" : node.state;
+          const radius = node.role === "base" ? 18 : 22;
+          const sub = node.role === "base" ? "receiver" : `${node.kind} | ${fmtRssi(node.rssi)}`;
+          parts.push(`<g>`);
+          parts.push(`<circle class="node-hit" cx="${p.x}" cy="${p.y}" r="42"></circle>`);
+          parts.push(`<circle class="node-core ${state}" cx="${p.x}" cy="${p.y}" r="${radius}"></circle>`);
+          parts.push(`<text class="node-label" x="${p.x + 30}" y="${p.y - 5}">${escapeHtml(node.label)}</text>`);
+          parts.push(`<text class="node-sub" x="${p.x + 30}" y="${p.y + 13}">${escapeHtml(sub)}</text>`);
+          parts.push(`</g>`);
+        }
+
+        svg.innerHTML = parts.join("");
+      }
+
+      function renderNodes(drones) {
+        nodeList.innerHTML = drones
+          .map((node) => {
+            const via = node.via === null || node.via === undefined ? "direct" : node.via === node.id ? "direct" : `via ${node.via}`;
+            const battery = node.battery === null || node.battery === undefined ? "battery n/a" : `${node.battery}%`;
+            const meta = `${fmtRssi(node.rssi)} | ${fmtAge(node.age_ms)} | ${via} | ${battery}`;
+            return `
+              <div class="node-row">
+                ${stateDot(node.state)}
+                <div>
+                  <div class="name">${escapeHtml(node.label)}</div>
+                  <div class="meta">${escapeHtml(meta)}</div>
+                </div>
+                <div class="badge">${escapeHtml(node.kind)}</div>
+              </div>
+            `;
+          })
+          .join("");
+      }
+
+      function renderEvents(events) {
+        eventList.innerHTML = events
+          .slice(0, 28)
+          .map((event) => {
+            const time = new Date(event.ts * 1000).toLocaleTimeString();
+            let label = event.message || event.kind;
+            let detail = "";
+            if (event.kind === "rx") {
+              const via = event.via && event.via !== event.node ? ` via ${event.via}` : "";
+              const rssi = event.rssi === null || event.rssi === undefined ? "RSSI n/a" : `${event.rssi} dBm`;
+              label = `RX ${event.source} node ${event.node}${via} seq ${event.seq ?? "n/a"} | ${event.message_type || "data"} | ${rssi}`;
+              if (event.payload) {
+                detail = `<code class="payload">${escapeHtml(event.payload)}</code>`;
+              }
+            }
+            return `<div class="event"><strong>${escapeHtml(label)}</strong>${detail}<span class="time">${time}</span></div>`;
+          })
+          .join("");
+      }
+
+      function renderJamToggles(drones, jammed) {
+        jamPanel.hidden = drones.length === 0;
+        if (drones.length === 0) {
+          jamToggles.innerHTML = "";
+          return;
+        }
+
+        const active = document.activeElement;
+        const activeNode = active && active.dataset ? active.dataset.node : null;
+        jamToggles.innerHTML = drones
+          .map((node) => {
+            const checked = jammed.has(node.id) ? "checked" : "";
+            return `
+              <div class="toggle-row">
+                <label for="jam-${node.id}">${escapeHtml(node.label)}</label>
+                <input id="jam-${node.id}" data-node="${node.id}" type="checkbox" ${checked} />
+              </div>
+            `;
+          })
+          .join("");
+
+        for (const input of jamToggles.querySelectorAll("input")) {
+          input.addEventListener("change", () => setJammed(Number(input.dataset.node), input.checked));
+          if (activeNode === input.dataset.node) input.focus();
+        }
+      }
+
+      async function setJammed(nodeId, jammed) {
+        await fetch("/api/sim/jam", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ node_id: nodeId, jammed }),
+        });
+      }
+
+      async function clearJamming() {
+        await fetch("/api/sim/reset", { method: "POST" });
+      }
+
+      function escapeHtml(value) {
+        return String(value)
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+
+      for (const tab of sidebarTabs) {
+        tab.addEventListener("click", () => setSidebarPage(tab.dataset.page));
+        tab.addEventListener("keydown", (event) => {
+          if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+          event.preventDefault();
+          const nextPage = tab.dataset.page === "nodes" ? "data" : "nodes";
+          setSidebarPage(nextPage);
+          document.querySelector(`.sidebar-tab[data-page="${nextPage}"]`)?.focus();
+        });
+      }
+
+      resetJam.addEventListener("click", clearJamming);
+
+      const events = new EventSource("/events");
+      events.addEventListener("open", () => {
+        connectionText.textContent = "Connected";
+      });
+      events.addEventListener("snapshot", (event) => {
+        render(JSON.parse(event.data));
+      });
+      events.addEventListener("error", () => {
+        connectionText.textContent = "Reconnecting";
+      });
+
+      fetch("/api/state")
+        .then((response) => response.json())
+        .then(render)
+        .catch(() => {
+          connectionText.textContent = "Waiting for dashboard";
+        });
+    </script>
+  </body>
+</html>

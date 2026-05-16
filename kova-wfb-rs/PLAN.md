@@ -5,7 +5,7 @@
 The basic UDP-like mesh is now working at a sufficient level for the hackathon
 prototype:
 
-- one shared `stream_id` for the group
+- one shared `stream_id` for the group: `0xdeadbeef`
 - TTL-limited route flooding
 - sender identity inside the app payload
 - per-origin sequence numbers for deduplication
@@ -15,6 +15,9 @@ prototype:
 - Unix UTC based hop schedule with NTP-synced hosts
 - sync heartbeats showing `slot_delta=0` and `channel_match=1`
 - UDP-like packet loss behavior; no retransmission dependency
+- Phase A mesh-group crypto implemented with ChaCha20-Poly1305
+- mesh crypto is config-only through `[mesh_crypto]`
+- Python and config defaults now use the team stream ID
 
 Current team `stream_id` is `0xdeadbeef`, which produces synthetic addr2/addr3
 `57:42:de:ad:be:ef` in Wireshark/tcpdump.
@@ -148,6 +151,12 @@ frames during debugging.
   enabling/disabling it or changing keys.
 - `mesh_txrx.py` authenticates secure mesh payloads before delivery/forwarding,
   re-encrypts mesh-group traffic after TTL decrement, and keeps a replay window.
+- `mesh_txrx.py` starts each process with a randomized origin sequence number to
+  avoid replay-window collisions when a node restarts under the same key epoch.
+- `configs/node1.ini`, `configs/node2.ini`, and `configs/node3.ini` now use
+  `stream_id = 0xdeadbeef`, producing `57:42:de:ad:be:ef` in captures.
+- `python/examples/simple_txrx.py` and `python/examples/mesh_txrx.py` default to
+  `0xdeadbeef` when no stream id is supplied.
 - Live tests have validated three nodes using TTL forwarding, deduplication,
   channel hopping, and sync heartbeats.
 - Secure mesh mode still needs a live three-node RF test.
@@ -849,6 +858,8 @@ Phase A - secure mesh baseline:
 - implemented: encrypt/authenticate mesh status/data with the mesh group key
 - implemented: add replay window for mesh group traffic
 - implemented: authenticate route metadata in AEAD associated data
+- implemented: config-only crypto controls
+- implemented: team stream id `0xdeadbeef`
 - next: live-test secure mesh mode across three nodes
 
 Phase B - opaque C2 traffic:
@@ -1086,23 +1097,24 @@ source.
 
 ## Next Implementation Steps
 
-1. Re-test three nodes with `[mesh_crypto] enabled = true`, `ttl=2`, channel
-   hopping, and sync heartbeats.
-2. Keep current plaintext mode available for debugging only.
-3. Add typed route addressing with `origin_type`, `destination_type`, and
+1. Re-test three nodes with `[mesh_crypto] enabled = true`, `stream_id =
+   0xdeadbeef`, `ttl=2`, channel hopping, and sync heartbeats.
+2. Confirm Wireshark/tcpdump filtering on `57:42:de:ad:be:ef`.
+3. Keep current plaintext mode available for debugging only.
+4. Add typed route addressing with `origin_type`, `destination_type`, and
    `traffic_class`.
-4. Add config sections for C2 keys: `[c2_uplink_crypto]`,
+5. Add config sections for C2 keys: `[c2_uplink_crypto]`,
    `[c2_downlink_crypto]`, `[c2_broadcast_crypto]`, `[node_identity]`, and
    `[trusted_c2]`.
-5. Implement node-to-C2 opaque payloads: relays can forward, only C2 can
+6. Implement node-to-C2 opaque payloads: relays can forward, only C2 can
    decrypt.
-6. Implement C2-to-node opaque payloads: relays can forward, only the target
+7. Implement C2-to-node opaque payloads: relays can forward, only the target
    node can decrypt.
-7. Add C2 command signatures, expiry checks, target checks, and command replay
+8. Add C2 command signatures, expiry checks, target checks, and command replay
    windows.
-8. Add key epochs to every secure packet and reject stale epochs after a grace
+9. Add key epochs to every secure packet and reject stale epochs after a grace
     period.
-9. Add C2-signed revocation and group rekey messages.
-10. Re-test three nodes with secure mesh status and opaque C2 test payloads.
-11. Only after that, work on adaptive channel switching messages.
-12. Keep channel hopping decisions based on authenticated data only.
+10. Add C2-signed revocation and group rekey messages.
+11. Re-test three nodes with secure mesh status and opaque C2 test payloads.
+12. Only after that, work on adaptive channel switching messages.
+13. Keep channel hopping decisions based on authenticated data only.

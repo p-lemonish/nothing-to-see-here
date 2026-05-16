@@ -15,6 +15,8 @@ Two different "channel" concepts, do not confuse:
 - **`stream_id`** — a 32-bit logical demux tag baked into the synthetic 802.11 addr2/addr3 MACs as `57:42:<stream_id big-endian>`. Lets multiple independent wfb streams share the same RF channel; RX drops frames whose embedded `stream_id` does not match.
 
 Two peers must agree on **both** the wifi channel and the `stream_id` to exchange traffic.
+The current team stream id is `0xdeadbeef`, which appears in packet captures as
+`57:42:de:ad:be:ef`.
 
 ## Runtime prerequisites
 
@@ -84,7 +86,7 @@ Both TX and RX on a single interface. Frames it injects itself are filtered out 
 
 On each peer:
 ```bash
-sudo ./target/debug/examples/simple_txrx --iface "$NIC" --stream-id 1
+sudo ./target/debug/examples/simple_txrx --iface "$NIC" --stream-id 0xdeadbeef
 ```
 
 Then type a line on peer A's stdin — it appears as `RX seq=… payload="…"` on peer B.
@@ -102,13 +104,13 @@ Separate `--role tx` and `--role rx` processes on two peers. The TX side generat
 Receiver:
 
 ```bash
-sudo ./target/debug/examples/bandwidth --role rx --iface "$NIC" --stream-id 1
+sudo ./target/debug/examples/bandwidth --role rx --iface "$NIC" --stream-id 0xdeadbeef
 ```
 
 Sender:
 
 ```bash
-sudo ./target/debug/examples/bandwidth --role tx --iface "$NIC" --stream-id 1
+sudo ./target/debug/examples/bandwidth --role tx --iface "$NIC" --stream-id 0xdeadbeef
 ```
 
 Useful knobs:
@@ -119,10 +121,17 @@ Useful knobs:
 
 ## Sniffing wfb_rs traffic with tcpdump
 
-wfb_rs-injected frames carry a fixed addr2/addr3 of `57:42:<stream_id big-endian>`. For `--stream-id 1` that's `57:42:00:00:00:01`:
+wfb_rs-injected frames carry a fixed addr2/addr3 of `57:42:<stream_id big-endian>`. For `--stream-id 0xdeadbeef` that is `57:42:de:ad:be:ef`:
 
 ```bash
-sudo tcpdump -i "$NIC" -y IEEE802_11_RADIO -nn -e -vvv 'wlan addr2 57:42:00:00:00:01'
+sudo tcpdump -i "$NIC" -y IEEE802_11_RADIO -nn -e -vvv 'wlan addr2 57:42:de:ad:be:ef'
+```
+
+Useful Wireshark filters:
+
+```text
+wlan.addr == 57:42:de:ad:be:ef
+wlan.addr contains 57:42:de:ad:be:ef
 ```
 
 To see all wfb_rs traffic regardless of `stream_id`, drop the filter and grep visually for addr2 starting `57:42:` — tcpdump's BPF for `wlan[N:M]` indexing on radiotap captures is not reliable across versions.
@@ -190,10 +199,10 @@ Usage:
 ```python
 from wfb_rs_py import Tx, Rx
 
-with Tx(iface="wlan0", stream_id=1) as tx:
+with Tx(iface="wlan0", stream_id=0xdeadbeef) as tx:
     tx.send(b"hello", seq=1)
 
-with Rx(iface="wlan0", stream_id=1) as rx:
+with Rx(iface="wlan0", stream_id=0xdeadbeef) as rx:
     maybe_frame = rx.recv_optional(timeout_ms=100)
     if maybe_frame is not None:
         payload, meta = maybe_frame
@@ -204,7 +213,7 @@ Runnable example:
 
 ```bash
 cd python
-sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py --stream-id 1
+sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py --stream-id 0xdeadbeef
 ```
 
 If `NIC`, `WFB_IFACE`, or `IFACE` is set, the Python example uses it as the
@@ -213,7 +222,7 @@ Wireshark/tcpdump:
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py \
-  --message "hello world" --include-self --stream-id 1
+  --message "hello world" --include-self --stream-id 0xdeadbeef
 ```
 
 To keep broadcasting while other peers come online on the same wifi channel and
@@ -221,7 +230,7 @@ To keep broadcasting while other peers come online on the same wifi channel and
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py \
-  --message "hello world" --count 0 --tx-interval-ms 1000 --stream-id 1
+  --message "hello world" --count 0 --tx-interval-ms 1000 --stream-id 0xdeadbeef
 ```
 
 The Python example also has an optional v0 app protocol header for compact
@@ -232,7 +241,7 @@ Peer A:
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py \
-  --iface "$NIC" --stream-id 1 --app-proto --sender-id 1 \
+  --iface "$NIC" --stream-id 0xdeadbeef --app-proto --sender-id 1 \
   --message "hello from node 1" --message-type hello --count 0 --tx-interval-ms 1000
 ```
 
@@ -240,7 +249,7 @@ Peer B:
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py \
-  --iface "$NIC" --stream-id 1 --app-proto --sender-id 2 \
+  --iface "$NIC" --stream-id 0xdeadbeef --app-proto --sender-id 2 \
   --message "hello from node 2" --message-type hello --count 0 --tx-interval-ms 1000
 ```
 
@@ -249,14 +258,14 @@ or receiver node with a unique sender id:
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/mesh_txrx.py \
-  --iface "$NIC" --stream-id 1 --sender-id 67
+  --iface "$NIC" --stream-id 0xdeadbeef --sender-id 67
 ```
 
 To originate a broadcast routed message:
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/mesh_txrx.py \
-  --iface "$NIC" --stream-id 1 --sender-id 42 \
+  --iface "$NIC" --stream-id 0xdeadbeef --sender-id 42 \
   --message "battery=91" --message-type status --destination-id 0 \
   --ttl 2 --count 0 --tx-interval-ms 1000
 ```
@@ -295,3 +304,71 @@ CH=36 TX secure origin=1 seq=... domain=mesh_group key_id=1001 key_epoch=1 len=1
 CH=36 RX secure via=2 origin=2 seq=... domain=mesh_group key_id=1001 key_epoch=1 decrypted=1
 CH=36 RX deliver via=2 origin=2 seq=... dest=0 ttl=2 type=status payload=[encrypted]
 ```
+
+For prototype C2 end-to-end encryption, use `route_v2` by switching a node to
+`traffic_class=c2_uplink`. Relays forward these packets as opaque ciphertext and
+do not decrypt the payload. The cloud C2 HTTP receiver decrypts the uploaded
+opaque payloads and shows them in a small web UI:
+
+```bash
+sudo -E "$VIRTUAL_ENV/bin/python" python/examples/c2_http_server.py \
+  --config configs/c2-local.ini --host 0.0.0.0 --port 8080
+```
+
+Then open:
+
+```text
+http://80.69.173.183:8080/
+```
+
+A dedicated RX-only RF gateway can bridge mesh C2 uplinks to the cloud without
+changing the normal node process. Edit `configs/c2-gateway.ini` with the
+gateway dongle iface, then run:
+
+```bash
+sudo -E "$VIRTUAL_ENV/bin/python" python/examples/c2_gateway.py --config configs/c2-gateway.ini
+```
+
+If the gateway should reuse a node already running on the same PC, leave the
+gateway iface unset and use the auto config. The node shares opaque C2 uplinks
+over a localhost UDP tap, so the gateway does not depend on RF self-capture from
+the same adapter:
+
+```bash
+sudo -E "$VIRTUAL_ENV/bin/python" python/examples/c2_gateway.py --config configs/c2-gateway-auto.ini
+```
+
+The auto config listens on `127.0.0.1:17801`. The node configs send local C2
+tap events there while still transmitting the same opaque packet over RF.
+
+The normal mesh processes can keep running unchanged:
+
+```bash
+sudo -E "$VIRTUAL_ENV/bin/python" python/examples/mesh_txrx.py --config configs/node1.ini
+sudo -E "$VIRTUAL_ENV/bin/python" python/examples/mesh_txrx.py --config configs/node2.ini
+sudo -E "$VIRTUAL_ENV/bin/python" python/examples/mesh_txrx.py --config configs/node3.ini
+```
+
+If the gateway shares the exact same dongle with another process, avoid two
+processes fighting over channel changes. Either run the gateway with
+`--no-channel-agility` and let the mesh process own hopping, or use a dedicated
+gateway dongle.
+
+To originate an opaque C2-bound datagram from a node:
+
+```bash
+python/.venv/bin/python python/examples/c2_send.py \
+  --config configs/node1.ini \
+  --message "node 1 c2 test"
+```
+
+The running node keeps its normal channel agility and emits `TX route_v2 ...
+class=c2_uplink ... source=local_control`. Relay nodes should log
+`RX opaque_route ... decrypt_skipped=1`. The gateway logs `HTTP c2_forward ...
+ok=1`, and the cloud page shows the decrypted payload under the origin node.
+
+The node configs also include a `[c2_uplink]` section. When enabled, the normal
+`mesh_txrx.py --config configs/nodeN.ini` process periodically sends
+`node N c2 test {counter}` as an encrypted C2 uplink while continuing normal
+mesh status and channel hopping. The C2 dashboard shows one latest row per node,
+updated in place as the counter changes.

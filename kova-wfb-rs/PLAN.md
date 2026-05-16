@@ -5,7 +5,7 @@
 The basic UDP-like mesh is now working at a sufficient level for the hackathon
 prototype:
 
-- one shared `stream_id` for the group
+- one shared `stream_id` for the group: `0xdeadbeef`
 - TTL-limited route flooding
 - sender identity inside the app payload
 - per-origin sequence numbers for deduplication
@@ -15,6 +15,15 @@ prototype:
 - Unix UTC based hop schedule with NTP-synced hosts
 - sync heartbeats showing `slot_delta=0` and `channel_match=1`
 - UDP-like packet loss behavior; no retransmission dependency
+- Phase A mesh-group crypto implemented with ChaCha20-Poly1305
+- Phase B route v2 and first E2E C2 payload mode implemented
+- Tiny C2 HTTP receiver implemented for decrypting and displaying
+  `node_to_c2` uplinks per node
+- mesh crypto is config-only through `[mesh_crypto]`
+- Python and config defaults now use the team stream ID
+
+Current team `stream_id` is `0xdeadbeef`, which produces synthetic addr2/addr3
+`57:42:de:ad:be:ef` in Wireshark/tcpdump.
 
 Observed live test results:
 
@@ -139,16 +148,130 @@ frames during debugging.
 - `app_proto.py` contains secure wrapper v1 helpers for ChaCha20-Poly1305 with
   `secure_version`, `security_domain`, `key_id`, `key_epoch`, `nonce`, and
   `ciphertext_and_tag`.
+- `app_proto.py` now includes structured `status` payload helpers and validation
+  (`status_version`, `uptime_s`, `battery_pct`, `peer_count`, `flags`).
+- `python/tests/test_app_proto.py` covers status payload edge cases and secure
+  status round-trips/authentication failure behavior.
 - `python/examples/mesh_txrx.py` supports Phase A mesh-group crypto for
   non-`sync` routed payloads when `[mesh_crypto] enabled = true`.
 - Mesh crypto is controlled by config only; there is no runtime CLI override for
   enabling/disabling it or changing keys.
 - `mesh_txrx.py` authenticates secure mesh payloads before delivery/forwarding,
   re-encrypts mesh-group traffic after TTL decrement, and keeps a replay window.
+- `mesh_txrx.py` starts each process with a randomized origin sequence number to
+  avoid replay-window collisions when a node restarts under the same key epoch.
+- `configs/node1.ini`, `configs/node2.ini`, and `configs/node3.ini` now use
+  `stream_id = 0xdeadbeef`, producing `57:42:de:ad:be:ef` in captures.
+- `python/examples/simple_txrx.py` and `python/examples/mesh_txrx.py` default to
+  `0xdeadbeef` when no stream id is supplied.
+- `mesh_txrx.py` now includes a local link-health state machine with transitions
+  `nominal -> degraded -> isolated -> moving -> rtb` and recovery back toward
+  `nominal` when links return.
+- `mesh_txrx.py` now auto-generates binary `status` payloads in `--status-auto`
+  mode and logs decoded structured status fields on receive.
+- `mesh_txrx.py` now supports `--message-file` and `--message-file-reload` for
+  binary demo payloads (for example camera snapshots).
 - Live tests have validated three nodes using TTL forwarding, deduplication,
   channel hopping, and sync heartbeats.
 - Secure mesh mode still needs a live three-node RF test.
+- Current secure mesh mode is not node-to-C2 end-to-end encryption. It encrypts
+  mesh payload bytes with the shared `mesh_group` key. Routing metadata remains
+  visible on the wire.
+- Route v2 now supports typed `node`/`c2` destinations and opaque E2E
+  `node_to_c2` / `c2_to_node` payloads for prototype testing.
+- `mesh_txrx.py` can forward opaque C2 uplinks to an HTTP `/ingest` endpoint
+  without decrypting them.
+- `c2_gateway.py` now provides a cleaner RX-only C2 bridge so normal mesh nodes
+  can keep running without cloud-forwarding logic in the same process.
+- `c2_gateway.py` can auto-detect a local running `mesh_txrx.py` process when
+  no gateway iface is configured, then open a second RX capture on that iface.
+- `mesh_txrx.py` can now accept localhost UDP control requests and originate
+  C2 uplinks from the normal hopping node process.
+- `c2_send.py` submits C2 uplink payloads to that local control port without
+  touching the radio.
+- `mesh_txrx.py` also emits opaque C2 uplink tap events over localhost so a
+  same-PC gateway can forward to cloud C2 without relying on RF self-capture.
+- `mesh_txrx.py` can periodically originate configured C2 uplink payloads
+  (`node N c2 test {counter}`) from the normal node process.
+- The C2 HTTP dashboard now displays the latest payload per node as one row per
+  origin node.
 - No ACK/retry/session example is implemented.
+
+## Current Wire Visibility
+
+Current Phase A secure mesh mode protects payload content from listeners who do
+not have the mesh group key, but it does not hide routing metadata.
+
+Plaintext/readable on the wire:
+
+```text
+802.11 synthetic MAC: 57:42:de:ad:be:ef
+outer app header
+route wrapper:
+  origin_sender_id
+  destination_id
+  ttl
+  origin_seq
+  inner_type
+  encrypted_payload_len
+secure wrapper:
+  secure_version
+  security_domain
+  key_id
+  key_epoch
+  nonce
+```
+
+Encrypted:
+
+```text
+actual inner payload bytes
+```
+
+For example, a listener can see that node `2` sent `type=status` with
+`seq=123`, but cannot read the status body without the `mesh_group` key.
+
+This is intentionally different from the planned C2 model:
+
+```text
+Current Phase A:
+  mesh-group encryption
+  trusted mesh nodes can decrypt and re-encrypt mesh payloads
+  useful for routine node-to-node status/data
+
+Planned Phase B:
+  node-to-C2 and C2-to-node end-to-end encryption
+  relays forward opaque encrypted payloads
+  only the endpoint can decrypt C2 payloads
+```
+
+Implemented Phase B slice:
+
+```text
+route_v2 metadata:
+  origin_type
+  origin_id
+  destination_type
+  destination_id
+  ttl
+  origin_seq
+  traffic_class
+  inner_type
+  encrypted_payload_len
+
+E2E payload:
+  secure_version
+  security_domain
+  key_id
+  key_epoch
+  nonce
+  ciphertext_and_tag
+```
+
+For E2E C2 traffic, relays can still see the route metadata above. They do not
+decrypt the inner payload, and they forward it unchanged while decrementing
+`ttl`. The E2E associated data authenticates immutable route fields but does not
+include `ttl`, because `ttl` is intentionally mutable by relays.
 
 ## Node-To-Node Test
 
@@ -160,7 +283,7 @@ Peer A:
 ```bash
 export NIC=wlx5cffffaba18f
 sudo python/.venv/bin/python python/examples/simple_txrx.py \
-  --iface "$NIC" --stream-id 1 --app-proto --sender-id 67 \
+  --iface "$NIC" --stream-id 0xdeadbeef --app-proto --sender-id 67 \
   --message "hello 42" --message-type hello --count 0 --tx-interval-ms 1000
 ```
 
@@ -169,7 +292,7 @@ Peer B:
 ```bash
 export NIC=wlxfc221c2004ce
 sudo python/.venv/bin/python python/examples/simple_txrx.py \
-  --iface "$NIC" --stream-id 1 --app-proto --sender-id 42 \
+  --iface "$NIC" --stream-id 0xdeadbeef --app-proto --sender-id 42 \
   --message "hello 67" --message-type hello --count 0 --tx-interval-ms 1000
 ```
 
@@ -348,7 +471,7 @@ but they should not be the default mesh mode.
 
 The mesh transport now works at a simple UDP-like level. The next phase is
 confidentiality, authenticity, and compromise containment. Compression and
-structured status can wait.
+additional status fields can wait.
 
 The key design shift:
 
@@ -846,14 +969,34 @@ Phase A - secure mesh baseline:
 - implemented: encrypt/authenticate mesh status/data with the mesh group key
 - implemented: add replay window for mesh group traffic
 - implemented: authenticate route metadata in AEAD associated data
+- implemented: config-only crypto controls
+- implemented: team stream id `0xdeadbeef`
+- current limitation: route metadata is plaintext; only the inner payload bytes
+  are encrypted
 - next: live-test secure mesh mode across three nodes
 
 Phase B - opaque C2 traffic:
 
-- add `destination_type`: node, C2, broadcast
-- add `node_to_c2` and `c2_to_node` key configs
-- let relays forward C2 packets without decrypting
-- only endpoints decrypt
+- implemented: add `route_v2` with `origin_type`, `destination_type`, and
+  `traffic_class`
+- implemented: add `node_to_c2` and `c2_to_node` config sections
+- implemented: let relays forward C2 packets without decrypting
+- implemented: only matching local endpoints decrypt when they have the key
+- implemented: add optional local C2/gateway config with multiple uplink keys
+- implemented: add a small C2 HTTP server that decrypts uploaded
+  `node_to_c2` payloads and displays them per node
+- implemented: add optional HTTP forwarding from `mesh_txrx.py` to C2 `/ingest`
+- implemented: add dedicated RX-only `c2_gateway.py` for RF-to-C2 forwarding
+- implemented: add gateway auto-iface discovery from a running mesh node
+- implemented: add local node control path for C2 uplink origination without a
+  second TX process
+- implemented: add localhost opaque C2 tap for same-PC C2 gateway forwarding
+- implemented: add periodic configured C2 uplink source in `mesh_txrx.py`
+- implemented: update C2 dashboard to render latest payload per node
+- current limitation: route metadata has E2E integrity but no separate outer hop
+  authentication layer yet
+- next: deploy/run the C2 HTTP receiver on the UpCloud host and RF-test
+  `c2_uplink` uploads through the mesh
 
 Phase C - C2 command authority:
 
@@ -929,8 +1072,9 @@ Rules:
 
 ### 17. Structured Status Payload
 
-Replace free-text status messages with a small binary status payload once secure
-transport is stable.
+The binary status payload format is now implemented at the protocol codec level.
+This gives a stable payload contract for status data regardless of transport
+mode.
 
 V1 status payload:
 
@@ -958,6 +1102,13 @@ Later status fields:
 - RSSI summaries
 - retry/loss estimates
 - GPS/position if available
+
+Current runtime behavior:
+
+- `mesh_txrx.py` emits structured binary status payloads by default when
+  `message_type=status` and no explicit payload is provided.
+- Status `flags` now carry runtime link/crypto/forwarding state for local
+  decision and demo observability.
 
 ### 18. Channel Agility Hardening
 
@@ -1083,23 +1234,24 @@ source.
 
 ## Next Implementation Steps
 
-1. Re-test three nodes with `[mesh_crypto] enabled = true`, `ttl=2`, channel
-   hopping, and sync heartbeats.
-2. Keep current plaintext mode available for debugging only.
-3. Add typed route addressing with `origin_type`, `destination_type`, and
+1. Re-test three nodes with `[mesh_crypto] enabled = true`, `stream_id =
+   0xdeadbeef`, `ttl=2`, channel hopping, and sync heartbeats.
+2. Confirm Wireshark/tcpdump filtering on `57:42:de:ad:be:ef`.
+3. Keep current plaintext mode available for debugging only.
+4. Add typed route addressing with `origin_type`, `destination_type`, and
    `traffic_class`.
-4. Add config sections for C2 keys: `[c2_uplink_crypto]`,
+5. Add config sections for C2 keys: `[c2_uplink_crypto]`,
    `[c2_downlink_crypto]`, `[c2_broadcast_crypto]`, `[node_identity]`, and
    `[trusted_c2]`.
-5. Implement node-to-C2 opaque payloads: relays can forward, only C2 can
+6. Implement node-to-C2 opaque payloads: relays can forward, only C2 can
    decrypt.
-6. Implement C2-to-node opaque payloads: relays can forward, only the target
+7. Implement C2-to-node opaque payloads: relays can forward, only the target
    node can decrypt.
-7. Add C2 command signatures, expiry checks, target checks, and command replay
+8. Add C2 command signatures, expiry checks, target checks, and command replay
    windows.
-8. Add key epochs to every secure packet and reject stale epochs after a grace
+9. Add key epochs to every secure packet and reject stale epochs after a grace
     period.
-9. Add C2-signed revocation and group rekey messages.
-10. Re-test three nodes with secure mesh status and opaque C2 test payloads.
-11. Only after that, work on adaptive channel switching messages.
-12. Keep channel hopping decisions based on authenticated data only.
+10. Add C2-signed revocation and group rekey messages.
+11. Re-test three nodes with secure mesh status and opaque C2 test payloads.
+12. Only after that, work on adaptive channel switching messages.
+13. Keep channel hopping decisions based on authenticated data only.

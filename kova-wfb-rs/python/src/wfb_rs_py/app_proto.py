@@ -21,6 +21,7 @@ MSG_DATA = 0x03
 MSG_STATUS = 0x04
 MSG_SYNC = 0x05
 MSG_ROUTE_DATA = 0x21
+MSG_ROUTE_V2 = 0x22
 
 MESSAGE_TYPES: dict[str, int] = {
     "hello": MSG_HELLO,
@@ -29,13 +30,29 @@ MESSAGE_TYPES: dict[str, int] = {
     "status": MSG_STATUS,
     "sync": MSG_SYNC,
     "route_data": MSG_ROUTE_DATA,
+    "route_v2": MSG_ROUTE_V2,
 }
 
 MESSAGE_TYPE_NAMES = {value: name for name, value in MESSAGE_TYPES.items()}
 ROUTE_DATA_PAYLOAD = struct.Struct("!BBBIBH")
 ROUTE_DATA_PAYLOAD_SIZE = ROUTE_DATA_PAYLOAD.size
+ROUTE_V2_VERSION = 1
+ROUTE_V2_PAYLOAD = struct.Struct("!BBBBBBIBBH")
+ROUTE_V2_PAYLOAD_SIZE = ROUTE_V2_PAYLOAD.size
+ROUTE_V2_E2E_ASSOCIATED_DATA = struct.Struct("!4sBBBBBIBBH")
+ROUTE_V2_E2E_ASSOCIATED_DATA_SIZE = ROUTE_V2_E2E_ASSOCIATED_DATA.size
 SYNC_PAYLOAD = struct.Struct("!QIHI")
 SYNC_PAYLOAD_SIZE = SYNC_PAYLOAD.size
+STATUS_VERSION = 1
+STATUS_PAYLOAD = struct.Struct("!BIBBB")
+STATUS_PAYLOAD_SIZE = STATUS_PAYLOAD.size
+STATUS_BATTERY_UNKNOWN = 0xFF
+STATUS_FLAG_DEGRADED_LINK = 0x01
+STATUS_FLAG_LOW_BATTERY = 0x02
+STATUS_FLAG_CRYPTO_ENABLED = 0x04
+STATUS_FLAG_FORWARDING_ENABLED = 0x08
+ROUTE_SECURE_ASSOCIATED_DATA = struct.Struct("!BBBIBH")
+ROUTE_SECURE_ASSOCIATED_DATA_SIZE = ROUTE_SECURE_ASSOCIATED_DATA.size
 SECURE_VERSION = 1
 SECURE_PAYLOAD = struct.Struct("!BBHI12s")
 SECURE_PAYLOAD_SIZE = SECURE_PAYLOAD.size
@@ -57,6 +74,34 @@ SECURITY_DOMAINS: dict[str, int] = {
 }
 
 SECURITY_DOMAIN_NAMES = {value: name for name, value in SECURITY_DOMAINS.items()}
+
+ADDR_BROADCAST = 0x00
+ADDR_NODE = 0x01
+ADDR_C2 = 0x02
+
+ADDRESS_TYPES: dict[str, int] = {
+    "broadcast": ADDR_BROADCAST,
+    "node": ADDR_NODE,
+    "c2": ADDR_C2,
+}
+
+ADDRESS_TYPE_NAMES = {value: name for name, value in ADDRESS_TYPES.items()}
+
+TRAFFIC_MESH = 0x01
+TRAFFIC_C2_UPLINK = 0x02
+TRAFFIC_C2_DOWNLINK = 0x03
+TRAFFIC_C2_BROADCAST = 0x04
+TRAFFIC_REKEY_CONTROL = 0x05
+
+TRAFFIC_CLASSES: dict[str, int] = {
+    "mesh": TRAFFIC_MESH,
+    "c2_uplink": TRAFFIC_C2_UPLINK,
+    "c2_downlink": TRAFFIC_C2_DOWNLINK,
+    "c2_broadcast": TRAFFIC_C2_BROADCAST,
+    "rekey_control": TRAFFIC_REKEY_CONTROL,
+}
+
+TRAFFIC_CLASS_NAMES = {value: name for name, value in TRAFFIC_CLASSES.items()}
 
 
 class AppFrameError(ValueError):
@@ -108,11 +153,86 @@ class RouteData:
 
 
 @dataclass(frozen=True)
+class RouteDataV2:
+    route_version: int
+    origin_type: int
+    origin_id: int
+    destination_type: int
+    destination_id: int
+    ttl: int
+    origin_seq: int
+    traffic_class: int
+    inner_type: int
+    inner_payload: bytes
+
+    @property
+    def origin_type_name(self) -> str:
+        return address_type_name(self.origin_type)
+
+    @property
+    def destination_type_name(self) -> str:
+        return address_type_name(self.destination_type)
+
+    @property
+    def traffic_class_name(self) -> str:
+        return traffic_class_name(self.traffic_class)
+
+    @property
+    def inner_type_name(self) -> str:
+        return message_type_name(self.inner_type)
+
+    @property
+    def dedupe_key(self) -> tuple[int, int, int]:
+        return (self.origin_type, self.origin_id, self.origin_seq)
+
+    def decremented_ttl(self) -> "RouteDataV2":
+        if self.ttl <= 0:
+            raise AppFrameError("cannot decrement route_v2 ttl below zero")
+        return RouteDataV2(
+            route_version=self.route_version,
+            origin_type=self.origin_type,
+            origin_id=self.origin_id,
+            destination_type=self.destination_type,
+            destination_id=self.destination_id,
+            ttl=self.ttl - 1,
+            origin_seq=self.origin_seq,
+            traffic_class=self.traffic_class,
+            inner_type=self.inner_type,
+            inner_payload=self.inner_payload,
+        )
+
+
+@dataclass(frozen=True)
 class SyncStatus:
     utc_ms: int
     slot: int
     channel: int
     next_hop_ms: int
+
+
+@dataclass(frozen=True)
+class StatusPayload:
+    status_version: int
+    uptime_s: int
+    battery_pct: int | None
+    peer_count: int
+    flags: int
+
+    @property
+    def degraded_link(self) -> bool:
+        return bool(self.flags & STATUS_FLAG_DEGRADED_LINK)
+
+    @property
+    def low_battery(self) -> bool:
+        return bool(self.flags & STATUS_FLAG_LOW_BATTERY)
+
+    @property
+    def crypto_enabled(self) -> bool:
+        return bool(self.flags & STATUS_FLAG_CRYPTO_ENABLED)
+
+    @property
+    def forwarding_enabled(self) -> bool:
+        return bool(self.flags & STATUS_FLAG_FORWARDING_ENABLED)
 
 
 @dataclass(frozen=True)
@@ -199,6 +319,80 @@ def security_domain_value(value: str | int) -> int:
 
 def security_domain_name(value: int) -> str:
     return SECURITY_DOMAIN_NAMES.get(value, f"0x{value:02x}")
+
+
+def address_type_value(value: str | int) -> int:
+    if isinstance(value, int):
+        _require_u8("address_type", value)
+        return value
+
+    text = value.strip().lower()
+    if text in ADDRESS_TYPES:
+        return ADDRESS_TYPES[text]
+
+    try:
+        parsed = int(text, 0)
+    except ValueError as exc:
+        valid = ", ".join(sorted(ADDRESS_TYPES))
+        raise AppFrameError(
+            f"unknown address type '{value}' (valid: {valid})"
+        ) from exc
+
+    _require_u8("address_type", parsed)
+    return parsed
+
+
+def address_type_name(value: int) -> str:
+    return ADDRESS_TYPE_NAMES.get(value, f"0x{value:02x}")
+
+
+def traffic_class_value(value: str | int) -> int:
+    if isinstance(value, int):
+        _require_u8("traffic_class", value)
+        return value
+
+    text = value.strip().lower()
+    if text in TRAFFIC_CLASSES:
+        return TRAFFIC_CLASSES[text]
+
+    try:
+        parsed = int(text, 0)
+    except ValueError as exc:
+        valid = ", ".join(sorted(TRAFFIC_CLASSES))
+        raise AppFrameError(
+            f"unknown traffic class '{value}' (valid: {valid})"
+        ) from exc
+
+    _require_u8("traffic_class", parsed)
+    return parsed
+
+
+def traffic_class_name(value: int) -> str:
+    return TRAFFIC_CLASS_NAMES.get(value, f"0x{value:02x}")
+
+
+def _require_origin_address(address_type: int, address_id: int) -> None:
+    _require_u8("origin_type", address_type)
+    _require_u8("origin_id", address_id)
+    if address_type == ADDR_BROADCAST:
+        raise AppFrameError("origin_type broadcast is invalid")
+    if address_type not in ADDRESS_TYPE_NAMES:
+        raise AppFrameError(f"unknown origin_type: 0x{address_type:02x}")
+    if address_id == 0:
+        raise AppFrameError("origin_id 0 is reserved")
+
+
+def _require_destination_address(address_type: int, address_id: int) -> None:
+    _require_u8("destination_type", address_type)
+    _require_u8("destination_id", address_id)
+    if address_type not in ADDRESS_TYPE_NAMES:
+        raise AppFrameError(f"unknown destination_type: 0x{address_type:02x}")
+    if address_type == ADDR_BROADCAST:
+        if address_id != 0:
+            raise AppFrameError("broadcast destination_id must be 0")
+        return
+    if address_id == 0:
+        raise AppFrameError("destination_id 0 is reserved for broadcast")
 
 
 def encode_frame(
@@ -295,6 +489,100 @@ def decode_route_data_payload(payload: bytes) -> RouteData:
     )
 
 
+def encode_route_v2_payload(
+    *,
+    origin_type: str | int,
+    origin_id: int,
+    destination_type: str | int,
+    destination_id: int,
+    ttl: int,
+    origin_seq: int,
+    traffic_class: str | int,
+    inner_type: str | int,
+    inner_payload: bytes,
+) -> bytes:
+    encoded_origin_type = address_type_value(origin_type)
+    encoded_destination_type = address_type_value(destination_type)
+    encoded_traffic_class = traffic_class_value(traffic_class)
+    _require_origin_address(encoded_origin_type, origin_id)
+    _require_destination_address(encoded_destination_type, destination_id)
+    _require_u8("ttl", ttl)
+    _require_u32("origin_seq", origin_seq)
+    msg_type = message_type_value(inner_type)
+    if msg_type in {MSG_ROUTE_DATA, MSG_ROUTE_V2}:
+        raise AppFrameError("route_v2 cannot carry nested route packets")
+    if len(inner_payload) > MAX_U16:
+        raise AppFrameError(
+            f"inner_payload too large for u16 length: {len(inner_payload)}"
+        )
+
+    return (
+        ROUTE_V2_PAYLOAD.pack(
+            ROUTE_V2_VERSION,
+            encoded_origin_type,
+            origin_id,
+            encoded_destination_type,
+            destination_id,
+            ttl,
+            origin_seq,
+            encoded_traffic_class,
+            msg_type,
+            len(inner_payload),
+        )
+        + inner_payload
+    )
+
+
+def decode_route_v2_payload(payload: bytes) -> RouteDataV2:
+    if len(payload) < ROUTE_V2_PAYLOAD_SIZE:
+        raise AppFrameError(
+            f"route_v2 payload too short: {len(payload)} < {ROUTE_V2_PAYLOAD_SIZE}"
+        )
+
+    (
+        route_version,
+        origin_type,
+        origin_id,
+        destination_type,
+        destination_id,
+        ttl,
+        origin_seq,
+        traffic_class,
+        inner_type,
+        inner_payload_len,
+    ) = ROUTE_V2_PAYLOAD.unpack_from(payload)
+    inner_payload = payload[ROUTE_V2_PAYLOAD_SIZE:]
+
+    if route_version != ROUTE_V2_VERSION:
+        raise AppFrameError(f"unsupported route_v2 version: {route_version}")
+    _require_origin_address(origin_type, origin_id)
+    _require_destination_address(destination_type, destination_id)
+    if traffic_class not in TRAFFIC_CLASS_NAMES:
+        raise AppFrameError(f"unknown traffic_class: 0x{traffic_class:02x}")
+    if inner_payload_len != len(inner_payload):
+        raise AppFrameError(
+            "inner_payload_len mismatch: "
+            f"header={inner_payload_len} actual={len(inner_payload)}"
+        )
+    if inner_type in {MSG_ROUTE_DATA, MSG_ROUTE_V2}:
+        raise AppFrameError("route_v2 cannot carry nested route packets")
+    if inner_type not in MESSAGE_TYPE_NAMES:
+        raise AppFrameError(f"unknown route_v2 inner_type: 0x{inner_type:02x}")
+
+    return RouteDataV2(
+        route_version=route_version,
+        origin_type=origin_type,
+        origin_id=origin_id,
+        destination_type=destination_type,
+        destination_id=destination_id,
+        ttl=ttl,
+        origin_seq=origin_seq,
+        traffic_class=traffic_class,
+        inner_type=inner_type,
+        inner_payload=inner_payload,
+    )
+
+
 def encode_sync_payload(
     *,
     utc_ms: int,
@@ -322,6 +610,139 @@ def decode_sync_payload(payload: bytes) -> SyncStatus:
         slot=slot,
         channel=channel,
         next_hop_ms=next_hop_ms,
+    )
+
+
+def encode_status_payload(
+    *,
+    uptime_s: int,
+    battery_pct: int | None,
+    peer_count: int,
+    flags: int = 0,
+    status_version: int = STATUS_VERSION,
+) -> bytes:
+    _require_u8("status_version", status_version)
+    if status_version != STATUS_VERSION:
+        raise AppFrameError(f"unsupported status_version: {status_version}")
+    _require_u32("uptime_s", uptime_s)
+    _require_u8("peer_count", peer_count)
+    _require_u8("flags", flags)
+
+    encoded_battery_pct = STATUS_BATTERY_UNKNOWN
+    if battery_pct is not None:
+        if not 0 <= battery_pct <= 100:
+            raise AppFrameError(
+                "battery_pct must be in range 0..100 or None for unknown"
+            )
+        encoded_battery_pct = battery_pct
+
+    return STATUS_PAYLOAD.pack(
+        status_version,
+        uptime_s,
+        encoded_battery_pct,
+        peer_count,
+        flags,
+    )
+
+
+def decode_status_payload(payload: bytes) -> StatusPayload:
+    if len(payload) != STATUS_PAYLOAD_SIZE:
+        raise AppFrameError(
+            f"status payload length mismatch: expected={STATUS_PAYLOAD_SIZE} "
+            f"actual={len(payload)}"
+        )
+
+    status_version, uptime_s, battery_pct, peer_count, flags = STATUS_PAYLOAD.unpack(payload)
+    if status_version != STATUS_VERSION:
+        raise AppFrameError(f"unsupported status_version: {status_version}")
+
+    decoded_battery_pct: int | None
+    if battery_pct == STATUS_BATTERY_UNKNOWN:
+        decoded_battery_pct = None
+    elif 0 <= battery_pct <= 100:
+        decoded_battery_pct = battery_pct
+    else:
+        raise AppFrameError(
+            "status battery_pct must be in range 0..100 or "
+            f"{STATUS_BATTERY_UNKNOWN} for unknown, got {battery_pct}"
+        )
+
+    return StatusPayload(
+        status_version=status_version,
+        uptime_s=uptime_s,
+        battery_pct=decoded_battery_pct,
+        peer_count=peer_count,
+        flags=flags,
+    )
+
+
+def encode_route_secure_associated_data(
+    *,
+    origin_sender_id: int,
+    destination_id: int,
+    ttl: int,
+    origin_seq: int,
+    inner_type: str | int,
+    inner_plaintext_len: int,
+) -> bytes:
+    if origin_sender_id == 0:
+        raise AppFrameError("origin_sender_id 0 is reserved")
+    _require_u8("origin_sender_id", origin_sender_id)
+    _require_u8("destination_id", destination_id)
+    _require_u8("ttl", ttl)
+    _require_u32("origin_seq", origin_seq)
+    _require_u16("inner_plaintext_len", inner_plaintext_len)
+    msg_type = message_type_value(inner_type)
+    if msg_type == MSG_ROUTE_DATA:
+        raise AppFrameError("route_data cannot carry nested route_data")
+    if msg_type not in MESSAGE_TYPE_NAMES:
+        raise AppFrameError(f"unknown route secure inner_type: 0x{msg_type:02x}")
+
+    return ROUTE_SECURE_ASSOCIATED_DATA.pack(
+        origin_sender_id,
+        destination_id,
+        ttl,
+        origin_seq,
+        msg_type,
+        inner_plaintext_len,
+    )
+
+
+def encode_route_v2_e2e_associated_data(
+    *,
+    origin_type: str | int,
+    origin_id: int,
+    destination_type: str | int,
+    destination_id: int,
+    origin_seq: int,
+    traffic_class: str | int,
+    inner_type: str | int,
+    inner_plaintext_len: int,
+) -> bytes:
+    encoded_origin_type = address_type_value(origin_type)
+    encoded_destination_type = address_type_value(destination_type)
+    encoded_traffic_class = traffic_class_value(traffic_class)
+    _require_origin_address(encoded_origin_type, origin_id)
+    _require_destination_address(encoded_destination_type, destination_id)
+    _require_u32("origin_seq", origin_seq)
+    _require_u16("inner_plaintext_len", inner_plaintext_len)
+    msg_type = message_type_value(inner_type)
+    if msg_type in {MSG_ROUTE_DATA, MSG_ROUTE_V2}:
+        raise AppFrameError("route_v2 cannot carry nested route packets")
+    if msg_type not in MESSAGE_TYPE_NAMES:
+        raise AppFrameError(f"unknown route_v2 inner_type: 0x{msg_type:02x}")
+
+    return ROUTE_V2_E2E_ASSOCIATED_DATA.pack(
+        b"e2e1",
+        ROUTE_V2_VERSION,
+        encoded_origin_type,
+        origin_id,
+        encoded_destination_type,
+        destination_id,
+        origin_seq,
+        encoded_traffic_class,
+        msg_type,
+        inner_plaintext_len,
     )
 
 

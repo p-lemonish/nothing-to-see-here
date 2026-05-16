@@ -81,39 +81,38 @@ Explicit flags still override the config values when you need a one-off change.
 
 ## Real Transmitter Heartbeats
 
-On each transmitter host/interface:
+On each transmitter host/interface, use that node's config:
 
 ```bash
-sudo -E python3 demo/node_status_tx.py \
-  --stream-id 1 \
-  --sender-id 1 \
-  --label TX-1 \
-  --x 0.18 \
-  --y 0.34 \
-  --battery 96 \
-  --interval-ms 1000
+sudo -E python3 demo/node_status_tx.py --config configs/node1.ini
 ```
 
-Change `--sender-id`, `--label`, `--x`, and `--y` for TX-2 and TX-3.
-Example positions matching `demo/nodes.json`:
+Change the config file for TX-2 and TX-3:
 
 ```bash
-# TX-1
-sudo -E python3 demo/node_status_tx.py --iface "$TXNIC" --stream-id 1 \
-  --sender-id 1 --label TX-1 --x 0.18 --y 0.34 --battery 96
-
-# TX-2
-sudo -E python3 demo/node_status_tx.py --iface "$TXNIC" --stream-id 1 \
-  --sender-id 2 --label TX-2 --x 0.54 --y 0.22 --battery 89
-
-# TX-3
-sudo -E python3 demo/node_status_tx.py --iface "$TXNIC" --stream-id 1 \
-  --sender-id 3 --label TX-3 --x 0.82 --y 0.48 --battery 82
+sudo -E python3 demo/node_status_tx.py --config configs/node2.ini
+sudo -E python3 demo/node_status_tx.py --config configs/node3.ini
 ```
 
 To originate a mesh-wrapped status packet instead of a direct status frame, add
 `--mesh --ttl 2`. Nodes that should relay still need to run the existing
 `python/examples/mesh_txrx.py` process.
+
+To let one physical transmitter advertise additional simulated nodes, repeat
+`--sim-node`. With `--sim-node`, the helper uses mesh wrapping by default so the
+dashboard sees the simulated node as the route origin and the physical
+transmitter as the `via` node:
+
+```bash
+sudo -E python3 demo/node_status_tx.py --config configs/node1.ini \
+  --sim-node 11,SIM-11,0.32,0.44,91 \
+  --sim-node 12,SIM-12,0.42,0.58,88
+```
+
+The simulated nodes are not dashboard-only objects in this mode. They are normal
+radio status heartbeats with their own logical sender IDs, sequence counters,
+positions, and batteries. If the physical transmitter stops, the real node and
+all simulated nodes advertised through it age out together.
 
 To make the helper follow the same channel-hopping schedule as the current mesh
 configs, add:

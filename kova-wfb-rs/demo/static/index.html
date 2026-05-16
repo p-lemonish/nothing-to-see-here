@@ -541,7 +541,7 @@
             </button>
           </div>
           <div class="sidebar-page" id="page-nodes" role="tabpanel" aria-labelledby="tab-nodes" data-page="nodes">
-            <section class="panel-section">
+            <section class="panel-section" id="jamPanel">
               <div class="section-head">
                 <h2>Jamming</h2>
                 <button class="reset-btn" id="resetJam">Clear</button>
@@ -581,6 +581,7 @@
       const uptime = document.getElementById("uptime");
       const sourceBadge = document.getElementById("sourceBadge");
       const resetJam = document.getElementById("resetJam");
+      const jamPanel = document.getElementById("jamPanel");
       const sidebarTabs = document.querySelectorAll(".sidebar-tab");
       const sidebarPages = document.querySelectorAll(".sidebar-page");
 
@@ -645,7 +646,11 @@
         renderSvg(nodes, links, nodeById);
         renderNodes(drones);
         renderEvents(snapshot.events || []);
-        renderJamToggles(drones, new Set(snapshot.jammed || []));
+        renderJamToggles(localSimNodes(drones, snapshot.stats.source), new Set(snapshot.jammed || []));
+      }
+
+      function localSimNodes(nodes, source) {
+        return nodes.filter((node) => node.source === "sim" || (source === "sim" && node.source === "config"));
       }
 
       function renderSvg(nodes, links, nodeById) {
@@ -730,6 +735,12 @@
       }
 
       function renderJamToggles(drones, jammed) {
+        jamPanel.hidden = drones.length === 0;
+        if (drones.length === 0) {
+          jamToggles.innerHTML = "";
+          return;
+        }
+
         const active = document.activeElement;
         const activeNode = active && active.dataset ? active.dataset.node : null;
         jamToggles.innerHTML = drones

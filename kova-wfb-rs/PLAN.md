@@ -136,8 +136,18 @@ frames during debugging.
 - `python/examples/mesh_txrx.py` uses Unix UTC time for the hop schedule,
   prints clock/schedule state, applies a TX guard after channel changes, and can
   send compact `sync` heartbeats for clock/slot/channel observability.
+- `app_proto.py` contains secure wrapper v1 helpers for ChaCha20-Poly1305 with
+  `secure_version`, `security_domain`, `key_id`, `key_epoch`, `nonce`, and
+  `ciphertext_and_tag`.
+- `python/examples/mesh_txrx.py` supports Phase A mesh-group crypto for
+  non-`sync` routed payloads when `[mesh_crypto] enabled = true`.
+- Mesh crypto is controlled by config only; there is no runtime CLI override for
+  enabling/disabling it or changing keys.
+- `mesh_txrx.py` authenticates secure mesh payloads before delivery/forwarding,
+  re-encrypts mesh-group traffic after TTL decrement, and keeps a replay window.
 - Live tests have validated three nodes using TTL forwarding, deduplication,
   channel hopping, and sync heartbeats.
+- Secure mesh mode still needs a live three-node RF test.
 - No ACK/retry/session example is implemented.
 
 ## Node-To-Node Test
@@ -832,10 +842,11 @@ Do not write decrypted C2 payloads to persistent disk unless required.
 
 Phase A - secure mesh baseline:
 
-- add secure wrapper with `security_domain` and `key_epoch`
-- encrypt/authenticate mesh status/data with the mesh group key
-- add replay window for mesh group traffic
-- keep route metadata visible but authenticated
+- implemented: add secure wrapper with `security_domain` and `key_epoch`
+- implemented: encrypt/authenticate mesh status/data with the mesh group key
+- implemented: add replay window for mesh group traffic
+- implemented: authenticate route metadata in AEAD associated data
+- next: live-test secure mesh mode across three nodes
 
 Phase B - opaque C2 traffic:
 
@@ -1072,26 +1083,23 @@ source.
 
 ## Next Implementation Steps
 
-1. Keep current plaintext mode for debugging only.
-2. Add secure wrapper v1 with `secure_version`, `security_domain`, `key_id`,
-   `key_epoch`, `nonce`, and `ciphertext_and_tag`.
-3. Add config sections for separate keys: `[mesh_crypto]`,
-   `[c2_uplink_crypto]`, `[c2_downlink_crypto]`, `[c2_broadcast_crypto]`,
-   `[node_identity]`, and `[trusted_c2]`.
-4. Implement mesh-group AEAD first for node-to-node broadcast/status traffic.
-5. Add replay windows for mesh-group traffic.
-6. Add typed route addressing with `origin_type`, `destination_type`, and
+1. Re-test three nodes with `[mesh_crypto] enabled = true`, `ttl=2`, channel
+   hopping, and sync heartbeats.
+2. Keep current plaintext mode available for debugging only.
+3. Add typed route addressing with `origin_type`, `destination_type`, and
    `traffic_class`.
-7. Implement node-to-C2 opaque payloads: relays can forward, only C2 can
+4. Add config sections for C2 keys: `[c2_uplink_crypto]`,
+   `[c2_downlink_crypto]`, `[c2_broadcast_crypto]`, `[node_identity]`, and
+   `[trusted_c2]`.
+5. Implement node-to-C2 opaque payloads: relays can forward, only C2 can
    decrypt.
-8. Implement C2-to-node opaque payloads: relays can forward, only the target
+6. Implement C2-to-node opaque payloads: relays can forward, only the target
    node can decrypt.
-9. Add C2 command signatures, expiry checks, target checks, and command replay
+7. Add C2 command signatures, expiry checks, target checks, and command replay
    windows.
-10. Add key epochs to every secure packet and reject stale epochs after a grace
+8. Add key epochs to every secure packet and reject stale epochs after a grace
     period.
-11. Add C2-signed revocation and group rekey messages.
-12. Re-test three nodes with `ttl=2`, channel hopping, sync heartbeats, secure
-    mesh status, and opaque C2 test payloads.
-13. Only after that, work on adaptive channel switching messages.
-14. Keep channel hopping decisions based on authenticated data only.
+9. Add C2-signed revocation and group rekey messages.
+10. Re-test three nodes with secure mesh status and opaque C2 test payloads.
+11. Only after that, work on adaptive channel switching messages.
+12. Keep channel hopping decisions based on authenticated data only.

@@ -114,6 +114,12 @@ channels `36,40,48` with 5-second slots, anchored to Unix UTC time
 so logs show clock skew, slot agreement, and channel agreement between nodes.
 To hold a node on its current channel while debugging, add `--no-channel-agility`.
 
+The starter configs enable `[mesh_crypto]` by default. Keep the same `key_id`,
+`key_epoch`, and 32-byte `key_hex` on every node. Non-`sync` mesh payloads are
+encrypted/authenticated with ChaCha20-Poly1305. `sync` heartbeats remain
+plaintext for observability. To temporarily debug plaintext mesh traffic, set
+`[mesh_crypto] enabled = false` in each node config.
+
 ## Tests
 
 ```bash

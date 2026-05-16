@@ -67,19 +67,17 @@ sudo -E python3 demo/dashboard_server.py \
 The dashboard decodes both direct app frames and `route_data` mesh frames.
 Open `http://127.0.0.1:8765` on the base computer.
 
-The current upstream starter configs enable synchronized channel hopping across
-channels `36,40,48`. If the transmitter nodes are using those configs, run the
-base dashboard with the same schedule:
+The current upstream starter configs already contain the monitor interface,
+`stream_id`, and synchronized channel-hopping schedule. If the transmitter nodes
+are using those configs, point the dashboard at the base node's config:
 
 ```bash
 sudo -E python3 demo/dashboard_server.py \
   --source radio \
-  --stream-id 1 \
-  --channel-agility \
-  --hop-channels 36,40,48 \
-  --hop-slot-ms 5000 \
-  --hop-epoch-ms 0
+  --config configs/node1.ini
 ```
+
+Explicit flags still override the config values when you need a one-off change.
 
 ## Real Transmitter Heartbeats
 
@@ -129,7 +127,7 @@ configs, add:
 1. Plug in the base USB Wi-Fi adapter.
 2. Confirm the patched driver is active with `ethtool -i "$RXNIC"`.
 3. Run `demo/setup_monitor.sh "$RXNIC" 36`.
-4. Start the dashboard with either fixed-channel mode or channel-agility mode,
-   matching the transmitters.
+4. Start the dashboard with `--config configs/node1.ini`, matching the
+   transmitter schedule.
 5. Start one transmitter heartbeat and confirm TX-1 turns online.
 6. Start TX-2 and TX-3.

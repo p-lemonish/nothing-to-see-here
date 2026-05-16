@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import configparser
 import json
 import mimetypes
 import os
@@ -23,6 +24,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 DEFAULT_NODES_PATH = Path(__file__).resolve().parent / "nodes.json"
 BASE_NODE_ID = 0
 MAX_U32 = 0xFFFF_FFFF
+CONFIG_SECTION = "mesh"
 
 if str(PY_SRC) not in sys.path:
     sys.path.insert(0, str(PY_SRC))
@@ -116,6 +118,83 @@ def _parse_csv_ints(value: str | None) -> list[int]:
         text = part.strip()
         if text:
             out.append(int(text, 0))
+    return out
+
+
+def _optional_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = value.strip()
+    if text.lower() in {"", "none", "null"}:
+        return None
+    return value
+
+
+def _load_mesh_config(path: str | None) -> dict[str, object]:
+    if path is None:
+        return {}
+
+    config_path = Path(path)
+    if not config_path.exists():
+        raise FileNotFoundError(f"config file not found: {path}")
+
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.read(config_path)
+    section = (
+        parser[CONFIG_SECTION]
+        if parser.has_section(CONFIG_SECTION)
+        else parser["DEFAULT"]
+    )
+
+    out: dict[str, object] = {}
+    for key in (
+        "iface",
+        "hop_channels",
+        "channel_width",
+    ):
+        if key in section:
+            value = _optional_text(section.get(key))
+            if value is not None:
+                out[key] = value
+
+    for key in (
+        "stream_id",
+        "radio_timeout_ms",
+        "rx_timeout_ms",
+        "hop_slot_ms",
+        "hop_epoch_ms",
+        "channel_settle_ms",
+        "sim_interval_ms",
+    ):
+        if key in section:
+            out[key] = int(section[key], 0)
+
+    for key in (
+        "channel_agility",
+        "channel_down_up",
+    ):
+        if key in section:
+            out[key] = section.getboolean(key)
+
+    for key in (
+        "source",
+        "host",
+    ):
+        if key in section:
+            value = _optional_text(section.get(key))
+            if value is not None:
+                out[key] = value
+
+    if "port" in section:
+        out["port"] = int(section["port"], 0)
+
+    for key in (
+        "stale_after_s",
+        "down_after_s",
+    ):
+        if key in section:
+            out[key] = float(section[key])
+
     return out
 
 
@@ -909,42 +988,103 @@ def make_handler(state: MeshState, static_dir: Path) -> type[BaseHTTPRequestHand
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Live dashboard for wfb_rs transmitter drones")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--source", choices=("sim", "radio", "both"), default="sim")
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument(
+        "--config",
+        help="read radio defaults from a configs/node*.ini [mesh] section",
+    )
+    config_args, _ = config_parser.parse_known_args()
+    try:
+        config_defaults = _load_mesh_config(config_args.config)
+    except (OSError, ValueError, configparser.Error) as exc:
+        raise SystemExit(f"dashboard_server.py: config error: {exc}") from exc
+
+    radio_timeout_default = config_defaults.get(
+        "radio_timeout_ms",
+        config_defaults.get("rx_timeout_ms", 100),
+    )
+
+    parser = argparse.ArgumentParser(
+        description="Live dashboard for wfb_rs transmitter drones",
+        parents=[config_parser],
+    )
+    parser.add_argument("--host", default=config_defaults.get("host", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=config_defaults.get("port", 8765))
+    parser.add_argument(
+        "--source",
+        choices=("sim", "radio", "both"),
+        default=config_defaults.get("source", "sim"),
+    )
     parser.add_argument(
         "--iface",
-        help="monitor-mode interface for radio source (default: $NIC, $WFB_IFACE, $IFACE, or single iw dev interface)",
+        default=config_defaults.get("iface"),
+        help=(
+            "monitor-mode interface for radio source "
+            "(default: $NIC, $WFB_IFACE, $IFACE, or single iw dev interface)"
+        ),
     )
-    parser.add_argument("--stream-id", type=lambda value: int(value, 0), default=1)
-    parser.add_argument("--radio-timeout-ms", type=int, default=100)
+    parser.add_argument(
+        "--stream-id",
+        type=lambda value: int(value, 0),
+        default=config_defaults.get("stream_id", 1),
+    )
+    parser.add_argument("--radio-timeout-ms", type=int, default=radio_timeout_default)
     parser.add_argument(
         "--channel-agility",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=config_defaults.get("channel_agility", False),
         help="follow the synchronized channel-hopping schedule used by mesh_txrx.py",
     )
     parser.add_argument(
         "--hop-channels",
-        default="36,40,48",
+        default=config_defaults.get("hop_channels", "36,40,48"),
         help="comma-separated channel schedule used with --channel-agility",
     )
-    parser.add_argument("--channel-width", default="HT20")
-    parser.add_argument("--hop-slot-ms", type=int, default=5000)
-    parser.add_argument("--hop-epoch-ms", type=int, default=0)
-    parser.add_argument("--channel-settle-ms", type=int, default=250)
+    parser.add_argument(
+        "--channel-width",
+        default=config_defaults.get("channel_width", "HT20"),
+    )
+    parser.add_argument(
+        "--hop-slot-ms",
+        type=int,
+        default=config_defaults.get("hop_slot_ms", 5000),
+    )
+    parser.add_argument(
+        "--hop-epoch-ms",
+        type=int,
+        default=config_defaults.get("hop_epoch_ms", 0),
+    )
+    parser.add_argument(
+        "--channel-settle-ms",
+        type=int,
+        default=config_defaults.get("channel_settle_ms", 250),
+    )
     parser.add_argument(
         "--channel-down-up",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=config_defaults.get("channel_down_up", True),
         help="bring interface down/up around channel changes",
     )
-    parser.add_argument("--sim-interval-ms", type=int, default=900)
+    parser.add_argument(
+        "--sim-interval-ms",
+        type=int,
+        default=config_defaults.get("sim_interval_ms", 900),
+    )
     parser.add_argument("--nodes", type=Path, default=DEFAULT_NODES_PATH)
-    parser.add_argument("--stale-after-s", type=float, default=2.5)
-    parser.add_argument("--down-after-s", type=float, default=6.0)
-    return parser.parse_args()
+    parser.add_argument(
+        "--stale-after-s",
+        type=float,
+        default=config_defaults.get("stale_after_s", 2.5),
+    )
+    parser.add_argument(
+        "--down-after-s",
+        type=float,
+        default=config_defaults.get("down_after_s", 6.0),
+    )
+    args = parser.parse_args()
+    if args.source not in {"sim", "radio", "both"}:
+        parser.error("--source must be one of: sim, radio, both")
+    return args
 
 
 def main() -> int:

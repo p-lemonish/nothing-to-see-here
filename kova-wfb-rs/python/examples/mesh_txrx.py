@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import os
+import struct
 import subprocess
 import time
 from collections import deque
@@ -14,19 +15,29 @@ from typing import Deque
 from wfb_rs_py import Rx, Tx
 from wfb_rs_py.app_proto import (
     AppFrameError,
+    CHACHA20_POLY1305_KEY_SIZE,
     MSG_ROUTE_DATA,
     MSG_SYNC,
+    SEC_DOMAIN_MESH_GROUP,
     decode_frame,
     decode_route_data_payload,
+    decode_secure_payload,
     decode_sync_payload,
+    decrypt_secure_payload,
     encode_frame,
     encode_route_data_payload,
+    encode_secure_payload,
     encode_sync_payload,
     message_type_value,
+    security_domain_name,
+    security_domain_value,
 )
 
+MAX_U16 = 0xFFFF
 MAX_U32 = 0xFFFF_FFFF
 CONFIG_SECTION = "mesh"
+MESH_CRYPTO_SECTION = "mesh_crypto"
+SECURE_ROUTE_AAD = struct.Struct("!4sBBBIBH")
 
 
 @dataclass(frozen=True)
@@ -36,6 +47,14 @@ class ScheduleState:
     slot_elapsed_ms: int
     channel: int
     next_hop_ms: int
+
+
+@dataclass(frozen=True)
+class MeshCryptoConfig:
+    security_domain: int
+    key_id: int
+    key_epoch: int
+    key: bytes
 
 
 def _default_iface() -> str | None:
@@ -65,6 +84,41 @@ def _parse_channel_list(value: object | None) -> list[int]:
         if text:
             channels.append(int(text, 0))
     return channels
+
+
+def _parse_key_hex(value: str) -> bytes:
+    try:
+        key = bytes.fromhex(value.strip())
+    except ValueError as exc:
+        raise ValueError("mesh_crypto key_hex must be valid hex") from exc
+    if len(key) != CHACHA20_POLY1305_KEY_SIZE:
+        raise ValueError(
+            "mesh_crypto key_hex must decode to "
+            f"{CHACHA20_POLY1305_KEY_SIZE} bytes, got {len(key)}"
+        )
+    return key
+
+
+def _secure_route_aad(
+    *,
+    origin_sender_id: int,
+    destination_id: int,
+    ttl: int,
+    origin_seq: int,
+    inner_type: int,
+    plaintext_len: int,
+) -> bytes:
+    if not 0 <= plaintext_len <= MAX_U16:
+        raise AppFrameError(f"secure plaintext_len must fit in u16: {plaintext_len}")
+    return SECURE_ROUTE_AAD.pack(
+        b"rtv1",
+        origin_sender_id,
+        destination_id,
+        ttl,
+        origin_seq,
+        inner_type,
+        plaintext_len,
+    )
 
 
 def _utc_ms() -> int:
@@ -215,6 +269,19 @@ def _load_config(path: str | None) -> dict[str, object]:
         if key in section:
             out[key] = section.getboolean(key)
 
+    if parser.has_section(MESH_CRYPTO_SECTION):
+        section = parser[MESH_CRYPTO_SECTION]
+        if "enabled" in section:
+            out["mesh_crypto_enabled"] = section.getboolean("enabled")
+        for key in ("security_domain", "key_hex"):
+            if key in section:
+                value = _optional_text(section.get(key))
+                if value is not None:
+                    out[f"mesh_crypto_{key}"] = value
+        for key in ("key_id", "key_epoch", "replay_window"):
+            if key in section:
+                out[f"mesh_crypto_{key}"] = int(section[key], 0)
+
     return out
 
 
@@ -225,6 +292,27 @@ class SeenRoutes:
         self._order: Deque[tuple[int, int]] = deque()
 
     def remember(self, key: tuple[int, int]) -> bool:
+        if key in self._seen:
+            return False
+
+        self._seen.add(key)
+        self._order.append(key)
+        while len(self._order) > self._limit:
+            old = self._order.popleft()
+            self._seen.discard(old)
+        return True
+
+    def contains(self, key: tuple[int, int]) -> bool:
+        return key in self._seen
+
+
+class ReplayWindow:
+    def __init__(self, limit: int):
+        self._limit = limit
+        self._seen: set[tuple[int, int, int, int]] = set()
+        self._order: Deque[tuple[int, int, int, int]] = deque()
+
+    def remember(self, key: tuple[int, int, int, int]) -> bool:
         if key in self._seen:
             return False
 
@@ -436,7 +524,40 @@ def main() -> int:
     if inner_type == MSG_SYNC:
         parser.error("--message-type sync is reserved for --sync-heartbeat")
 
+    mesh_crypto_enabled = bool(config_defaults.get("mesh_crypto_enabled", False))
+    mesh_replay_window = int(config_defaults.get("mesh_crypto_replay_window", 4096))
+    if mesh_replay_window < 1:
+        parser.error("[mesh_crypto] replay_window must be > 0")
+
+    mesh_crypto: MeshCryptoConfig | None = None
+    if mesh_crypto_enabled:
+        domain = security_domain_value(
+            config_defaults.get("mesh_crypto_security_domain", "mesh_group")
+        )
+        if domain != SEC_DOMAIN_MESH_GROUP:
+            parser.error("Phase A only supports mesh_crypto security_domain=mesh_group")
+        key_id = int(config_defaults.get("mesh_crypto_key_id", 0))
+        key_epoch = int(config_defaults.get("mesh_crypto_key_epoch", 0))
+        key_hex = config_defaults.get("mesh_crypto_key_hex")
+        if not 1 <= key_id <= MAX_U16:
+            parser.error("[mesh_crypto] key_id must be in range 1..65535")
+        if not 0 <= key_epoch <= MAX_U32:
+            parser.error("[mesh_crypto] key_epoch must fit in u32")
+        if not key_hex:
+            parser.error("[mesh_crypto] key_hex is required when enabled=true")
+        try:
+            mesh_key = _parse_key_hex(str(key_hex))
+        except ValueError as exc:
+            parser.error(str(exc))
+        mesh_crypto = MeshCryptoConfig(
+            security_domain=domain,
+            key_id=key_id,
+            key_epoch=key_epoch,
+            key=mesh_key,
+        )
+
     seen = SeenRoutes(args.seen_limit)
+    secure_replay = ReplayWindow(mesh_replay_window)
     inner_payload = args.message.encode("utf-8") if args.message is not None else None
     next_origin_seq = 1
     next_outer_seq = 1
@@ -481,25 +602,105 @@ def main() -> int:
             return None
         return _schedule_state(hop_channels, args.hop_slot_ms, args.hop_epoch_ms)
 
+    def encrypt_mesh_payload(
+        *,
+        origin_sender_id: int,
+        destination_id: int,
+        ttl: int,
+        origin_seq: int,
+        inner_type: int,
+        plaintext: bytes,
+    ) -> bytes:
+        if mesh_crypto is None or inner_type == MSG_SYNC:
+            return plaintext
+        aad = _secure_route_aad(
+            origin_sender_id=origin_sender_id,
+            destination_id=destination_id,
+            ttl=ttl,
+            origin_seq=origin_seq,
+            inner_type=inner_type,
+            plaintext_len=len(plaintext),
+        )
+        return encode_secure_payload(
+            key=mesh_crypto.key,
+            security_domain=mesh_crypto.security_domain,
+            key_id=mesh_crypto.key_id,
+            key_epoch=mesh_crypto.key_epoch,
+            plaintext=plaintext,
+            associated_data=aad,
+        )
+
+    def decrypt_mesh_payload(route) -> tuple[bytes, bool]:
+        if mesh_crypto is None or route.inner_type == MSG_SYNC:
+            return route.inner_payload, False
+
+        secure = decode_secure_payload(route.inner_payload)
+        if secure.security_domain != mesh_crypto.security_domain:
+            raise AppFrameError(
+                "unexpected security_domain: "
+                f"{secure.security_domain_name} "
+                f"expected={security_domain_name(mesh_crypto.security_domain)}"
+            )
+        if secure.key_id != mesh_crypto.key_id:
+            raise AppFrameError(
+                f"unexpected key_id: {secure.key_id} expected={mesh_crypto.key_id}"
+            )
+        if secure.key_epoch != mesh_crypto.key_epoch:
+            raise AppFrameError(
+                "unexpected key_epoch: "
+                f"{secure.key_epoch} expected={mesh_crypto.key_epoch}"
+            )
+
+        replay_key = (
+            secure.security_domain,
+            route.origin_sender_id,
+            secure.key_epoch,
+            route.origin_seq,
+        )
+        aad = _secure_route_aad(
+            origin_sender_id=route.origin_sender_id,
+            destination_id=route.destination_id,
+            ttl=route.ttl,
+            origin_seq=route.origin_seq,
+            inner_type=route.inner_type,
+            plaintext_len=secure.plaintext_len,
+        )
+        plaintext = decrypt_secure_payload(
+            secure,
+            key=mesh_crypto.key,
+            associated_data=aad,
+        )
+        if not secure_replay.remember(replay_key):
+            raise AppFrameError("secure replay detected")
+        return plaintext, True
+
     def send_route(
         *,
         inner_type: int,
         payload: bytes,
         destination_id: int,
         ttl: int,
-    ) -> int:
+    ) -> tuple[int, bool]:
         nonlocal next_origin_seq, next_outer_seq, next_rf_seq
         if tx is None:
             raise RuntimeError("TX handle is not open")
 
         seq_sent = next_origin_seq
+        routed_payload = encrypt_mesh_payload(
+            origin_sender_id=args.sender_id,
+            destination_id=destination_id,
+            ttl=ttl,
+            origin_seq=seq_sent,
+            inner_type=inner_type,
+            plaintext=payload,
+        )
         route_payload = encode_route_data_payload(
             origin_sender_id=args.sender_id,
             destination_id=destination_id,
             ttl=ttl,
             origin_seq=seq_sent,
             inner_type=inner_type,
-            inner_payload=payload,
+            inner_payload=routed_payload,
         )
         frame = _encode_outer_route_frame(
             sender_id=args.sender_id,
@@ -511,7 +712,7 @@ def main() -> int:
         next_origin_seq = _next_seq(next_origin_seq)
         next_outer_seq = _next_seq(next_outer_seq)
         next_rf_seq = _next_seq(next_rf_seq)
-        return seq_sent
+        return seq_sent, routed_payload is not payload
 
     def build_sync_payload() -> tuple[bytes, ScheduleState | None]:
         state = current_schedule_state()
@@ -604,16 +805,24 @@ def main() -> int:
                 and tx_allowed
             )
             if should_originate:
-                sent_seq = send_route(
+                sent_seq, secured = send_route(
                     inner_type=inner_type,
                     payload=inner_payload,
                     destination_id=args.destination_id,
                     ttl=args.ttl,
                 )
+                if secured and mesh_crypto is not None:
+                    log(
+                        f"TX secure origin={args.sender_id} seq={sent_seq} "
+                        f"domain={security_domain_name(mesh_crypto.security_domain)} "
+                        f"key_id={mesh_crypto.key_id} "
+                        f"key_epoch={mesh_crypto.key_epoch} len={len(inner_payload)}"
+                    )
                 log(
                     f"TX route origin={args.sender_id} seq={sent_seq} "
                     f"dest={args.destination_id} ttl={args.ttl} "
-                    f"type={args.message_type} len={len(inner_payload)}"
+                    f"type={args.message_type} len={len(inner_payload)} "
+                    f"secure={int(secured)}"
                 )
                 originated_count += 1
                 next_tx_at = now + (args.tx_interval_ms / 1000.0)
@@ -625,7 +834,7 @@ def main() -> int:
             )
             if should_sync:
                 sync_payload, sync_state = build_sync_payload()
-                sent_seq = send_route(
+                sent_seq, _ = send_route(
                     inner_type=MSG_SYNC,
                     payload=sync_payload,
                     destination_id=0,
@@ -680,13 +889,33 @@ def main() -> int:
                 )
                 continue
 
-            if not seen.remember(route.dedupe_key):
+            if seen.contains(route.dedupe_key):
                 log(
                     f"RX duplicate_route via={frame.sender_id} "
                     f"origin={route.origin_sender_id} seq={route.origin_seq} "
                     "dropped=1"
                 )
                 continue
+
+            try:
+                route_payload, route_secured = decrypt_mesh_payload(route)
+            except AppFrameError as exc:
+                log(
+                    f'RX auth_fail via={frame.sender_id} '
+                    f'origin={route.origin_sender_id} seq={route.origin_seq} '
+                    f'type={route.inner_type_name} error="{exc}" dropped=1'
+                )
+                continue
+
+            seen.remember(route.dedupe_key)
+            if route_secured and mesh_crypto is not None:
+                log(
+                    f"RX secure via={frame.sender_id} "
+                    f"origin={route.origin_sender_id} seq={route.origin_seq} "
+                    f"domain={security_domain_name(mesh_crypto.security_domain)} "
+                    f"key_id={mesh_crypto.key_id} "
+                    f"key_epoch={mesh_crypto.key_epoch} decrypted=1"
+                )
 
             delivered = route.destination_id in (0, args.sender_id)
             suffix = ""
@@ -699,12 +928,12 @@ def main() -> int:
             if delivered:
                 if route.inner_type == MSG_SYNC:
                     try:
-                        sync = decode_sync_payload(route.inner_payload)
+                        sync = decode_sync_payload(route_payload)
                     except AppFrameError as exc:
                         log(
                             f'RX invalid_sync via={frame.sender_id} '
                             f'origin={route.origin_sender_id} seq={route.origin_seq} '
-                            f'len={len(route.inner_payload)} error="{exc}"'
+                            f'len={len(route_payload)} error="{exc}"'
                         )
                     else:
                         local_state = current_schedule_state()
@@ -726,12 +955,18 @@ def main() -> int:
                             f"next_hop_ms={sync.next_hop_ms}{suffix}"
                         )
                 else:
-                    text = route.inner_payload.decode("utf-8", errors="replace")
+                    text = route_payload.decode("utf-8", errors="replace")
+                    payload_text = (
+                        "[encrypted]"
+                        if route_secured
+                        else f'"{text}"'
+                    )
                     log(
                         f'RX deliver via={frame.sender_id} '
                         f'origin={route.origin_sender_id} seq={route.origin_seq} '
                         f'dest={route.destination_id} ttl={route.ttl} '
-                        f'type={route.inner_type_name} payload="{text}"{suffix}'
+                        f"type={route.inner_type_name} payload={payload_text}"
+                        f"{suffix}"
                     )
             else:
                 log(
@@ -744,13 +979,21 @@ def main() -> int:
                 continue
 
             forwarded = route.decremented_ttl()
+            forward_inner_payload = encrypt_mesh_payload(
+                origin_sender_id=forwarded.origin_sender_id,
+                destination_id=forwarded.destination_id,
+                ttl=forwarded.ttl,
+                origin_seq=forwarded.origin_seq,
+                inner_type=forwarded.inner_type,
+                plaintext=route_payload,
+            )
             forward_payload = encode_route_data_payload(
                 origin_sender_id=forwarded.origin_sender_id,
                 destination_id=forwarded.destination_id,
                 ttl=forwarded.ttl,
                 origin_seq=forwarded.origin_seq,
                 inner_type=forwarded.inner_type,
-                inner_payload=forwarded.inner_payload,
+                inner_payload=forward_inner_payload,
             )
             forward_frame = _encode_outer_route_frame(
                 sender_id=args.sender_id,
@@ -758,10 +1001,19 @@ def main() -> int:
                 route_payload=forward_payload,
             )
             tx.send(forward_frame, seq=next_rf_seq)
+            forward_secured = forward_inner_payload is not route_payload
+            if forward_secured and mesh_crypto is not None:
+                log(
+                    f"TX secure_forward origin={forwarded.origin_sender_id} "
+                    f"seq={forwarded.origin_seq} "
+                    f"domain={security_domain_name(mesh_crypto.security_domain)} "
+                    f"key_id={mesh_crypto.key_id} "
+                    f"key_epoch={mesh_crypto.key_epoch}"
+                )
             log(
                 f"TX forward origin={forwarded.origin_sender_id} "
                 f"seq={forwarded.origin_seq} dest={forwarded.destination_id} "
-                f"ttl={forwarded.ttl}"
+                f"ttl={forwarded.ttl} secure={int(forward_secured)}"
             )
             next_outer_seq = _next_seq(next_outer_seq)
             next_rf_seq = _next_seq(next_rf_seq)

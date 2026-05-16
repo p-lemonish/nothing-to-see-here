@@ -1,12 +1,36 @@
-# UDP-Like Node-To-Node App Protocol Plan
+# UDP-Like Mesh Protocol Plan
 
-## Current Goal
+## Current Status
 
-Keep the protocol simple and easy to iterate on. For now, treat packets as
-UDP-like datagrams:
+The basic UDP-like mesh is now working at a sufficient level for the hackathon
+prototype:
 
-- one shared wifi channel for the group
 - one shared `stream_id` for the group
+- TTL-limited route flooding
+- sender identity inside the app payload
+- per-origin sequence numbers for deduplication
+- periodic status messages
+- three-node forwarding
+- synchronized channel hopping across `36,40,48`
+- Unix UTC based hop schedule with NTP-synced hosts
+- sync heartbeats showing `slot_delta=0` and `channel_match=1`
+- UDP-like packet loss behavior; no retransmission dependency
+
+Observed live test results:
+
+- two-node and three-node tests deliver status messages across the mesh
+- `ttl=2` works and is acceptable for the current room-scale mesh
+- duplicates and own-route returns are expected and are dropped
+- node 2 showed about `75-80 ms` skew
+- node 3 showed about `100 ms` skew
+- both are acceptable with `hop_slot_ms=5000` and `channel_tx_guard_ms=250`
+
+## Operating Model
+
+Keep the protocol simple and easy to iterate on. Treat packets as UDP-like
+datagrams:
+
+- one shared logical `stream_id` for the group
 - sender identity lives inside the app payload
 - receivers may drop packets without requiring retransmission
 - application data must be safe if a frame is lost
@@ -112,6 +136,8 @@ frames during debugging.
 - `python/examples/mesh_txrx.py` uses Unix UTC time for the hop schedule,
   prints clock/schedule state, applies a TX guard after channel changes, and can
   send compact `sync` heartbeats for clock/slot/channel observability.
+- Live tests have validated three nodes using TTL forwarding, deduplication,
+  channel hopping, and sync heartbeats.
 - No ACK/retry/session example is implemented.
 
 ## Node-To-Node Test
@@ -185,14 +211,14 @@ break the simple datagram path.
 
 Confidentiality:
 
-- Later: encrypt payloads with AEAD, likely ChaCha20-Poly1305.
-- For now: assume payloads are observable on the RF channel.
+- Next: encrypt payloads with AEAD, using ChaCha20-Poly1305.
+- Until secure mode is enabled, assume payloads are observable on the RF channel.
 
 Integrity:
 
 - CRC32C can detect accidental corruption and framing bugs.
 - CRC is not authentication because hostile senders can recompute it.
-- Later: use AEAD authentication tags or HMAC for real tamper detection.
+- Next: use AEAD authentication tags for real tamper detection.
 
 Availability:
 
@@ -201,7 +227,9 @@ Availability:
 - Track last-heard timestamps per sender.
 - Track loss estimates from app sequence gaps.
 - Use bounded repeat sends for important datagrams.
-- Later: add channel-health metrics and operator-assisted channel fallback.
+- Current fixed-schedule channel hopping is working.
+- Later: add channel-health metrics and operator-assisted/adaptive channel
+  fallback.
 
 ## Mesh Direction
 
@@ -301,42 +329,50 @@ stable:
 - SYN/SYN_ACK/FIN/FIN_ACK session lifecycle
 - sliding windows
 - route-aware ACKs
-- automatic channel switching
+- adaptive channel switching based on authenticated control frames
 
 These may be useful later for directed critical commands or larger transfers,
 but they should not be the default mesh mode.
 
-## Next Phase: Security, Compression, And Status
+## Next Phase: Crypto First
 
-The mesh transport now works at a simple UDP-like level. The next phase should
-improve operational usefulness without changing the radio layer or adding ACKs.
+The mesh transport now works at a simple UDP-like level. The next phase is
+confidentiality and authenticity. Compression and structured status can wait.
 
 Implementation order:
 
-1. Mesh log ergonomics.
-2. AEAD secure payload wrapper.
-3. Config-based shared keys.
-4. Authenticated mesh forwarding.
-5. Optional compression.
-6. Structured status payloads.
-7. Channel-health metrics and channel agility.
+1. Add config-based shared keys.
+2. Add AEAD secure payload encode/decode helpers and tests.
+3. Encrypt routed inner payloads.
+4. Authenticate route metadata as associated data.
+5. Drop unauthenticated secure frames before delivery or forwarding.
+6. Add clear crypto logs that do not print secrets.
+7. Keep plaintext mode available for debugging.
+8. Add optional compression later.
+9. Add structured status later.
+10. Add passive channel-health metrics later.
 
-### 1. Mesh Log Ergonomics
+### 1. Config-Based Shared Keys
 
-Add config options:
+Start with static shared keys in config files for hackathon speed.
+
+Config example:
 
 ```ini
-log_level = info
-quiet_duplicates = true
+secure = true
+key_id = 1
+key_hex = 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
 ```
 
-Suggested behavior:
+Rules:
 
-- `debug`: print invalid frames, duplicates, own-route drops, forwards, delivers.
-- `info`: print local deliveries, local sends, forwards, auth failures.
-- `quiet_duplicates = true`: suppress duplicate route drop lines.
-
-This should be implemented before crypto so three-node tests remain readable.
+- `key_hex` must decode to 32 bytes for ChaCha20-Poly1305.
+- `key_id` is sent in the secure wrapper.
+- Receivers choose the right key by `key_id`.
+- Do not print keys in logs.
+- Keep keys out of packet captures and screenshots.
+- For the first version, all mesh nodes can share one symmetric group key.
+- Later, support key rotation and per-peer keys.
 
 ### 2. AEAD Secure Payload Wrapper
 
@@ -360,66 +396,17 @@ offset  size  field
 
 `ciphertext_and_tag` contains the encrypted inner payload plus the AEAD tag.
 
-Associated data must include all unencrypted metadata that must not be tampered
-with:
-
-For direct app frames:
-
-```text
-version, message_type, sender_id, flags, app_seq, payload_len
-```
-
-For routed frames, include both the outer app header and route wrapper metadata:
-
-```text
-outer app header
-origin_sender_id
-destination_id
-ttl
-origin_seq
-inner_type
-inner_payload_len
-```
-
-Rules:
-
-- Drop frames that fail AEAD authentication.
-- Do not deliver unauthenticated secure payloads.
-- Do not forward unauthenticated `route_data`.
-- Keep routing metadata visible for forwarding, but authenticated.
-- Keep actual application payload confidential.
-
-### 3. Config-Based Shared Keys
-
-Start with static shared keys in config files for hackathon speed.
-
-Config example:
-
-```ini
-secure = true
-key_id = 1
-key_hex = 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
-```
-
-Rules:
-
-- `key_hex` must decode to 32 bytes for ChaCha20-Poly1305.
-- `key_id` is sent in the secure wrapper.
-- Receivers choose the right key by `key_id`.
-- Do not print keys in logs.
-- Keep keys out of packet captures and screenshots.
-
 Nonce strategy for v1:
 
 ```text
-nonce = sender_id(1 byte) || app_seq(4 bytes) || origin_seq_or_zero(4 bytes) || counter(3 bytes)
+nonce = random 96-bit value from os.urandom(12)
 ```
 
-This is simple but must still guarantee no nonce reuse for the same key. If this
-gets complicated, use a random 96-bit nonce and accept the tiny collision risk
-for the hackathon demo.
+Random nonces are simple and safe enough for the prototype as long as the same
+key is not used for an enormous number of packets. Later, switch to a
+deterministic nonce if we need stricter guarantees.
 
-### 4. Authenticated Mesh Forwarding
+### 3. Authenticated Mesh Forwarding
 
 For `route_data`, forwarding nodes must be able to authenticate route metadata
 before forwarding.
@@ -427,21 +414,86 @@ before forwarding.
 Recommended first version:
 
 - encrypt only `inner_payload`
-- authenticate route metadata as associated data
 - keep `origin_sender_id`, `destination_id`, `ttl`, `origin_seq`, and
   `inner_type` visible
+- authenticate route metadata as AEAD associated data
+- include `ttl` in associated data for hop authentication
 - decrement TTL during forwarding
 - after decrementing TTL, re-wrap/re-authenticate with the forwarding node's key
 
 This means each hop authenticates what it forwards. It is simpler than trying to
-preserve an end-to-end tag across TTL mutation.
+preserve one authentication tag across mutable TTL.
 
 Later, add end-to-end payload auth if needed:
 
 - inner origin authentication tag over original payload
 - hop authentication tag over mutable route metadata
 
-### 5. Optional Compression
+### 4. Associated Data
+
+Associated data must include all unencrypted metadata that must not be tampered
+with.
+
+For routed frames, include:
+
+```text
+origin_sender_id
+destination_id
+ttl
+origin_seq
+inner_type
+inner_plaintext_len
+```
+
+The outer app header can remain outside the first implementation's associated
+data because forwarding changes the outer sender and outer app sequence. The
+route wrapper is the important mesh contract.
+
+Rules:
+
+- Drop frames that fail AEAD authentication.
+- Do not deliver unauthenticated secure payloads.
+- Do not forward unauthenticated secure `route_data`.
+- Keep routing metadata visible for forwarding, but authenticated.
+- Keep actual application payload confidential.
+- Keep `sync` payloads plaintext for now unless we decide that channel/sync
+  metadata must also be hidden.
+
+### 5. Crypto Logging
+
+Add enough logs to debug interoperability without leaking secrets:
+
+```text
+TX secure origin=1 seq=... key_id=1 len=...
+RX secure via=2 origin=2 seq=... key_id=1 decrypted=1
+RX auth_fail via=2 origin=2 seq=... key_id=1 dropped=1
+```
+
+Do not log:
+
+- `key_hex`
+- plaintext payload when secure mode is enabled, unless explicitly in debug mode
+- nonces unless needed for deep debugging
+
+### 6. Mesh Log Ergonomics
+
+Add config options:
+
+```ini
+log_level = info
+quiet_duplicates = true
+```
+
+Suggested behavior:
+
+- `debug`: print invalid frames, duplicates, own-route drops, forwards, delivers.
+- `info`: print local deliveries, local sends, forwards, auth failures.
+- `quiet_duplicates = true`: suppress duplicate route drop lines.
+
+This can happen before or after the first crypto patch. Crypto is now the main
+priority.
+
+### 7. Optional Compression
 
 Add compression only after AEAD is working.
 
@@ -474,7 +526,7 @@ Rules:
   payload header.
 - Start with `none` as default.
 
-### 6. Structured Status Payload
+### 8. Structured Status Payload
 
 Replace free-text status messages with a small binary status payload once secure
 transport is stable.
@@ -506,12 +558,12 @@ Later status fields:
 - retry/loss estimates
 - GPS/position if available
 
-### 7. Channel Agility
+### 9. Channel Agility Hardening
 
 Channel agility is relevant for availability, but it must be added carefully.
-Unsynchronized hopping can make the mesh worse by causing healthy nodes to miss
-each other. Automatic channel switching should happen only after authenticated
-control frames exist.
+The fixed Unix-time schedule is working. The remaining work is adaptive channel
+selection and recovery when the mesh is degraded or lost. Automatic channel
+switching decisions should happen only after authenticated control frames exist.
 
 Start with a conservative model:
 
@@ -630,13 +682,16 @@ source.
 
 ## Next Implementation Steps
 
-1. Add `log_level` and `quiet_duplicates` to `mesh_txrx.py` and config files.
+1. Add Python crypto dependency wiring for ChaCha20-Poly1305.
 2. Add secure payload encode/decode helpers and tests.
 3. Add config parsing for `secure`, `key_id`, and `key_hex`.
-4. Add authenticated encryption for routed inner payloads.
-5. Ensure unauthenticated secure frames are dropped and not forwarded.
-6. Add optional compression after encryption works.
-7. Add structured status payloads after secure transport is stable.
-8. Test fixed-schedule channel hopping and sync heartbeats across three nodes.
-9. Add passive channel-health metrics.
-10. Add authenticated channel-agility controls and rendezvous behavior.
+4. Add authenticated encryption for routed inner payloads in `mesh_txrx.py`.
+5. Ensure secure frames that fail authentication are dropped before delivery or
+   forwarding.
+6. Keep plaintext mode available with `secure = false`.
+7. Add crypto-safe logs.
+8. Re-test three nodes with `ttl=2`, channel hopping, sync heartbeats, and
+   encrypted status payloads.
+9. Add optional log quieting if the crypto test logs become too noisy.
+10. Revisit compression, structured status, and adaptive channel agility after
+    crypto is stable.

@@ -106,6 +106,8 @@ frames during debugging.
 - `python/examples/mesh_txrx.py` supports `--config` for simple node config files.
 - `configs/node1.ini`, `configs/node2.ini`, and `configs/node3.ini` are starter
   configs. Set each `iface` from `iw dev`.
+- `python/examples/mesh_txrx.py` supports experimental synchronized channel
+  hopping via `channel_agility`, `hop_channels`, and `hop_slot_ms`.
 - No ACK/retry/session example is implemented.
 
 ## Node-To-Node Test
@@ -579,12 +581,30 @@ Rules:
 
 Implementation stages:
 
-1. Add passive channel-health metrics only; no switching.
-2. Add manual `--set-channel` helper or documented `iw` commands.
-3. Add config parsing for primary, backup, rendezvous, and emergency channels.
-4. Add authenticated channel-intent messages.
-5. Add degraded-mode scheduled hopping.
-6. Add lost-mode scan and rendezvous recovery.
+1. Add experimental fixed-schedule hopping across a configured channel list.
+2. Add passive channel-health metrics.
+3. Add manual `--set-channel` helper or documented `iw` commands.
+4. Add config parsing for primary, backup, rendezvous, and emergency channels.
+5. Add authenticated channel-intent messages.
+6. Add degraded-mode scheduled hopping based on channel-health metrics.
+7. Add lost-mode scan and rendezvous recovery.
+
+Current experimental mode:
+
+```ini
+channel_agility = true
+hop_channels = 36,40,48
+channel_width = HT20
+hop_slot_ms = 5000
+hop_epoch_ms = 0
+channel_settle_ms = 250
+channel_down_up = true
+```
+
+All nodes use wall-clock time to pick the same channel slot. During a switch,
+`mesh_txrx.py` closes its radio handles, changes the interface channel, reopens
+the handles, and resumes UDP-like send/receive. Packets lost during the switch
+are accepted as normal UDP-like loss.
 
 ## Next Implementation Steps
 
@@ -595,5 +615,6 @@ Implementation stages:
 5. Ensure unauthenticated secure frames are dropped and not forwarded.
 6. Add optional compression after encryption works.
 7. Add structured status payloads after secure transport is stable.
-8. Add passive channel-health metrics.
-9. Add authenticated channel-agility controls and rendezvous behavior.
+8. Test fixed-schedule channel hopping across three nodes.
+9. Add passive channel-health metrics.
+10. Add authenticated channel-agility controls and rendezvous behavior.

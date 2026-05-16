@@ -108,6 +108,10 @@ sudo -E "$VIRTUAL_ENV/bin/python" examples/mesh_txrx.py --config ../configs/node
 sudo -E "$VIRTUAL_ENV/bin/python" examples/mesh_txrx.py --config ../configs/node3.ini
 ```
 
+The starter configs enable experimental synchronized channel hopping across
+channels `36,40,48` with 5-second slots. To hold a node on its current channel
+while debugging, add `--no-channel-agility`.
+
 ## Tests
 
 ```bash

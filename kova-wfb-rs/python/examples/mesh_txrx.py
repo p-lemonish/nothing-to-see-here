@@ -2495,7 +2495,6 @@ def main() -> int:
                         continue
 
                     seen.remember(route_v2.dedupe_key)
-                    text = route_payload.decode("utf-8", errors="replace")
                     log(
                         f"RX e2e via={frame.sender_id} origin={origin_label} "
                         f"seq={route_v2.origin_seq} dest={dest_label} "
@@ -2503,7 +2502,7 @@ def main() -> int:
                         f"type={route_v2.inner_type_name} "
                         f"domain={secure.security_domain_name} "
                         f"key_id={secure.key_id} key_epoch={secure.key_epoch} "
-                        f'decrypted=1 payload="{text}"{suffix}'
+                        f"decrypted=1 len={len(route_payload)}{suffix}"
                     )
                 else:
                     seen.remember(route_v2.dedupe_key)

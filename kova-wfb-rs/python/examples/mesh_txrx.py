@@ -532,6 +532,7 @@ def _load_config(path: str | None) -> dict[str, object]:
         "destination_type",
         "traffic_class",
         "c2_http_forward_url",
+        "dashboard_url",
         "local_control_bind_host",
         "message_type",
         "message",
@@ -841,6 +842,13 @@ def main() -> int:
         "--c2-http-forward-url",
         default=config_defaults.get("c2_http_forward_url"),
         help="optional C2 /ingest URL for forwarding opaque c2_uplink route_v2 packets",
+    )
+    parser.add_argument(
+        "--dashboard-url",
+        default=config_defaults.get("dashboard_url"),
+        help="base URL of dashboard_server (e.g. http://127.0.0.1:8765); "
+             "mesh_txrx will POST route_data observations to /ingest so dashboard "
+             "can run with --source feed instead of opening the NIC directly",
     )
     parser.add_argument(
         "--destination-id",
@@ -1159,6 +1167,14 @@ def main() -> int:
         args.c2_http_forward_url = _normalize_ingest_url(args.c2_http_forward_url)
     except ValueError as exc:
         parser.error(str(exc))
+
+    dashboard_ingest_url: str | None = None
+    if args.dashboard_url:
+        raw = args.dashboard_url.rstrip("/")
+        parsed_dash = urllib.parse.urlparse(raw)
+        if not parsed_dash.scheme or not parsed_dash.netloc:
+            parser.error("--dashboard-url must include scheme and host")
+        dashboard_ingest_url = raw + "/ingest"
 
     if args.count < 0:
         parser.error("--count must be >= 0")
@@ -1929,6 +1945,44 @@ def main() -> int:
         duplicate = int(bool(parsed.get("duplicate", False)))
         return True, f"http_status={response.status} duplicate={duplicate}"
 
+    def post_route_observation(
+        *,
+        origin_id: int,
+        via_id: int,
+        seq: int,
+        inner_type: int,
+        payload: bytes,
+        rssi: int | None,
+    ) -> None:
+        if dashboard_ingest_url is None:
+            return
+        body = json.dumps(
+            {
+                "origin_id": origin_id,
+                "via_id": via_id,
+                "seq": seq,
+                "inner_type": message_type_name(inner_type),
+                "payload_hex": payload.hex(),
+                "rssi": rssi,
+                "freq": None,
+                "bandwidth": None,
+                "mcs_index": None,
+                "source": "radio",
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            dashboard_ingest_url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=0.5) as _:
+                pass
+        except (OSError, urllib.error.URLError):
+            pass
+
     def send_route(
         *,
         inner_type: int,
@@ -2678,6 +2732,16 @@ def main() -> int:
                     f"RX transit via={frame.sender_id} "
                     f"origin={route.origin_sender_id} seq={route.origin_seq} "
                     f"dest={route.destination_id} ttl={route.ttl}{suffix}"
+                )
+
+            if delivered and route.inner_type not in {MSG_ROUTE_ADV, MSG_SYNC}:
+                post_route_observation(
+                    origin_id=route.origin_sender_id,
+                    via_id=frame.sender_id,
+                    seq=route.origin_seq,
+                    inner_type=route.inner_type,
+                    payload=route_payload,
+                    rssi=meta.rssi[0] if meta.rssi else None,
                 )
 
             if route.ttl <= 0:

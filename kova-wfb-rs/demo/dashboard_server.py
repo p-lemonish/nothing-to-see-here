@@ -635,6 +635,32 @@ class MeshState:
         }
 
 
+def _handle_ingest(state: MeshState, data: dict[str, Any]) -> None:
+    origin_id = _coerce_int(data.get("origin_id"))
+    if origin_id is None:
+        return
+    via_id = _coerce_int(data.get("via_id")) or origin_id
+    seq = _coerce_int(data.get("seq"))
+    inner_type = str(data.get("inner_type", "data"))
+    try:
+        payload = bytes.fromhex(str(data.get("payload_hex", "")))
+    except ValueError:
+        payload = b""
+    state.ingest_observation(
+        origin_id=origin_id,
+        via_id=via_id,
+        seq=seq,
+        payload=payload,
+        message_type=inner_type,
+        rssi=_coerce_int(data.get("rssi")),
+        freq=_coerce_int(data.get("freq")),
+        bandwidth=_coerce_int(data.get("bandwidth")),
+        mcs_index=_coerce_int(data.get("mcs_index")),
+        source=str(data.get("source", "radio")),
+        kind="real",
+    )
+
+
 def load_node_config(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"nodes": []}
@@ -961,6 +987,12 @@ def make_handler(state: MeshState, static_dir: Path) -> type[BaseHTTPRequestHand
                 self._send_json(state.snapshot())
                 return
 
+            if parsed.path == "/ingest":
+                data = self._read_json_body()
+                _handle_ingest(state, data)
+                self._send_json({"ok": True})
+                return
+
             self._send_json({"error": "not found"}, status=404)
 
         def _serve_events(self) -> None:
@@ -1045,8 +1077,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=config_defaults.get("port", 8765))
     parser.add_argument(
         "--source",
-        choices=("sim", "radio", "both"),
+        choices=("sim", "radio", "both", "feed"),
         default=config_defaults.get("source", "sim"),
+        help="sim=simulated, radio=raw NIC, both=sim+radio, feed=HTTP push from mesh_txrx",
     )
     parser.add_argument(
         "--iface",
@@ -1185,8 +1218,12 @@ def main() -> int:
     for thread in threads:
         thread.start()
 
+    class _Server(ThreadingHTTPServer):
+        allow_reuse_address = True
+        allow_reuse_port = True
+
     handler = make_handler(state, STATIC_DIR)
-    server = ThreadingHTTPServer((args.host, args.port), handler)
+    server = _Server((args.host, args.port), handler)
     url = f"http://{args.host}:{args.port}"
     print(f"Dashboard listening on {url}")
     if args.source in {"radio", "both"}:

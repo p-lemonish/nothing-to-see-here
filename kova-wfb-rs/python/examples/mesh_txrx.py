@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Deque
 
-from wfb_rs_py import Rx, Tx
+from wfb_rs_py import Rx, Tx, WfbRsError
 from wfb_rs_py.app_proto import (
     ADDR_BROADCAST,
     ADDR_C2,
@@ -2007,7 +2007,7 @@ def main() -> int:
                         ttl=args.c2_uplink_ttl,
                         traffic_class=TRAFFIC_C2_UPLINK,
                     )
-                except (AppFrameError, ValueError, KeyError) as exc:
+                except (AppFrameError, ValueError, KeyError, WfbRsError) as exc:
                     log(f'C2_UPLINK send_error counter={c2_uplink_counter} error="{exc}"')
                 else:
                     log(
@@ -2054,7 +2054,7 @@ def main() -> int:
                         ttl=control.ttl,
                         traffic_class=TRAFFIC_C2_UPLINK,
                     )
-                except AppFrameError as exc:
+                except (AppFrameError, WfbRsError) as exc:
                     log(
                         f'LOCAL_CONTROL send_error source={control.source} '
                         f'error="{exc}"'
@@ -2096,67 +2096,71 @@ def main() -> int:
                 and tx_allowed
             )
             if should_originate:
-                if use_route_v2:
-                    sent_seq, e2e_crypto, sent_route = send_route_v2(
-                        inner_type=inner_type,
-                        payload=origin_payload,
-                        destination_type=destination_type,
-                        destination_id=args.destination_id,
-                        ttl=args.ttl,
-                        traffic_class=traffic_class,
-                    )
-                    log(
-                        f"TX e2e origin={_addr_label(origin_type, args.sender_id)} "
-                        f"seq={sent_seq} "
-                        f"dest={_addr_label(destination_type, args.destination_id)} "
-                        f"class={traffic_class_name(traffic_class)} "
-                        f"domain={security_domain_name(e2e_crypto.security_domain)} "
-                        f"key_id={e2e_crypto.key_id} "
-                        f"key_epoch={e2e_crypto.key_epoch} "
-                        f"len={len(origin_payload)}"
-                    )
-                    log(
-                        f"TX route_v2 "
-                        f"origin={_addr_label(origin_type, args.sender_id)} "
-                        f"seq={sent_seq} "
-                        f"dest={_addr_label(destination_type, args.destination_id)} "
-                        f"ttl={args.ttl} class={traffic_class_name(traffic_class)} "
-                        f"type={args.message_type} len={len(origin_payload)} "
-                        "e2e=1"
-                    )
-                    emit_local_c2_tap(sent_route, reason="originated")
-                    if (
-                        args.c2_http_forward_url is not None
-                        and sent_route.traffic_class == TRAFFIC_C2_UPLINK
-                    ):
-                        ok, detail = post_c2_upload(sent_route)
-                        log(
-                            f"HTTP c2_forward origin={sent_route.origin_id} "
-                            f"seq={sent_route.origin_seq} "
-                            f"dest={_addr_label(sent_route.destination_type, sent_route.destination_id)} "
-                            f"ok={int(ok)} detail=\"{detail}\""
+                try:
+                    if use_route_v2:
+                        sent_seq, e2e_crypto, sent_route = send_route_v2(
+                            inner_type=inner_type,
+                            payload=origin_payload,
+                            destination_type=destination_type,
+                            destination_id=args.destination_id,
+                            ttl=args.ttl,
+                            traffic_class=traffic_class,
                         )
+                        log(
+                            f"TX e2e origin={_addr_label(origin_type, args.sender_id)} "
+                            f"seq={sent_seq} "
+                            f"dest={_addr_label(destination_type, args.destination_id)} "
+                            f"class={traffic_class_name(traffic_class)} "
+                            f"domain={security_domain_name(e2e_crypto.security_domain)} "
+                            f"key_id={e2e_crypto.key_id} "
+                            f"key_epoch={e2e_crypto.key_epoch} "
+                            f"len={len(origin_payload)}"
+                        )
+                        log(
+                            f"TX route_v2 "
+                            f"origin={_addr_label(origin_type, args.sender_id)} "
+                            f"seq={sent_seq} "
+                            f"dest={_addr_label(destination_type, args.destination_id)} "
+                            f"ttl={args.ttl} class={traffic_class_name(traffic_class)} "
+                            f"type={args.message_type} len={len(origin_payload)} "
+                            "e2e=1"
+                        )
+                        emit_local_c2_tap(sent_route, reason="originated")
+                        if (
+                            args.c2_http_forward_url is not None
+                            and sent_route.traffic_class == TRAFFIC_C2_UPLINK
+                        ):
+                            ok, detail = post_c2_upload(sent_route)
+                            log(
+                                f"HTTP c2_forward origin={sent_route.origin_id} "
+                                f"seq={sent_route.origin_seq} "
+                                f"dest={_addr_label(sent_route.destination_type, sent_route.destination_id)} "
+                                f"ok={int(ok)} detail=\"{detail}\""
+                            )
+                    else:
+                        sent_seq, secured = send_route(
+                            inner_type=inner_type,
+                            payload=origin_payload,
+                            destination_id=args.destination_id,
+                            ttl=args.ttl,
+                        )
+                        if secured and mesh_crypto is not None:
+                            log(
+                                f"TX secure origin={args.sender_id} seq={sent_seq} "
+                                f"domain={security_domain_name(mesh_crypto.security_domain)} "
+                                f"key_id={mesh_crypto.key_id} "
+                                f"key_epoch={mesh_crypto.key_epoch} len={len(origin_payload)}"
+                            )
+                        log(
+                            f"TX route origin={args.sender_id} seq={sent_seq} "
+                            f"dest={args.destination_id} ttl={args.ttl} "
+                            f"type={args.message_type} len={len(origin_payload)} "
+                            f"secure={int(secured)}"
+                        )
+                except WfbRsError as exc:
+                    log(f'TX send_error kind=originated error="{exc}"')
                 else:
-                    sent_seq, secured = send_route(
-                        inner_type=inner_type,
-                        payload=origin_payload,
-                        destination_id=args.destination_id,
-                        ttl=args.ttl,
-                    )
-                    if secured and mesh_crypto is not None:
-                        log(
-                            f"TX secure origin={args.sender_id} seq={sent_seq} "
-                            f"domain={security_domain_name(mesh_crypto.security_domain)} "
-                            f"key_id={mesh_crypto.key_id} "
-                            f"key_epoch={mesh_crypto.key_epoch} len={len(origin_payload)}"
-                        )
-                    log(
-                        f"TX route origin={args.sender_id} seq={sent_seq} "
-                        f"dest={args.destination_id} ttl={args.ttl} "
-                        f"type={args.message_type} len={len(origin_payload)} "
-                        f"secure={int(secured)}"
-                    )
-                originated_count += 1
+                    originated_count += 1
                 next_tx_at = now + (args.tx_interval_ms / 1000.0)
 
             should_sync = (
@@ -2166,25 +2170,29 @@ def main() -> int:
             )
             if should_sync:
                 sync_payload, sync_state = build_sync_payload()
-                sent_seq, _ = send_route(
-                    inner_type=MSG_SYNC,
-                    payload=sync_payload,
-                    destination_id=0,
-                    ttl=args.ttl,
-                )
-                if sync_state is None:
-                    log(
-                        f"TX sync origin={args.sender_id} seq={sent_seq} "
-                        f"dest=0 ttl={args.ttl} utc_ms={_utc_ms()} "
-                        f"slot=0 channel={current_channel or 0} next_hop_ms=0"
+                try:
+                    sent_seq, _ = send_route(
+                        inner_type=MSG_SYNC,
+                        payload=sync_payload,
+                        destination_id=0,
+                        ttl=args.ttl,
                     )
+                except WfbRsError as exc:
+                    log(f'TX send_error kind=sync error="{exc}"')
                 else:
-                    log(
-                        f"TX sync origin={args.sender_id} seq={sent_seq} "
-                        f"dest=0 ttl={args.ttl} utc_ms={sync_state.utc_ms} "
-                        f"slot={sync_state.slot} channel={sync_state.channel} "
-                        f"next_hop_ms={sync_state.next_hop_ms}"
-                    )
+                    if sync_state is None:
+                        log(
+                            f"TX sync origin={args.sender_id} seq={sent_seq} "
+                            f"dest=0 ttl={args.ttl} utc_ms={_utc_ms()} "
+                            f"slot=0 channel={current_channel or 0} next_hop_ms=0"
+                        )
+                    else:
+                        log(
+                            f"TX sync origin={args.sender_id} seq={sent_seq} "
+                            f"dest=0 ttl={args.ttl} utc_ms={sync_state.utc_ms} "
+                            f"slot={sync_state.slot} channel={sync_state.channel} "
+                            f"next_hop_ms={sync_state.next_hop_ms}"
+                        )
                 next_sync_at = now + (args.sync_interval_ms / 1000.0)
 
             result = rx.recv_optional(timeout_ms=args.rx_timeout_ms)
@@ -2322,7 +2330,15 @@ def main() -> int:
                     app_seq=next_outer_seq,
                     route_payload=forward_payload,
                 )
-                tx.send(forward_frame, seq=next_rf_seq)
+                try:
+                    tx.send(forward_frame, seq=next_rf_seq)
+                except WfbRsError as exc:
+                    log(
+                        f'TX send_error kind=forward_v2 origin={origin_label} '
+                        f'seq={forwarded.origin_seq} error="{exc}"'
+                    )
+                    next_rf_seq = _next_seq(next_rf_seq)
+                    continue
                 log(
                     f"TX forward_v2 origin={origin_label} "
                     f"seq={forwarded.origin_seq} dest={dest_label} "
@@ -2497,7 +2513,15 @@ def main() -> int:
                 app_seq=next_outer_seq,
                 route_payload=forward_payload,
             )
-            tx.send(forward_frame, seq=next_rf_seq)
+            try:
+                tx.send(forward_frame, seq=next_rf_seq)
+            except WfbRsError as exc:
+                log(
+                    f'TX send_error kind=forward origin={forwarded.origin_sender_id} '
+                    f'seq={forwarded.origin_seq} error="{exc}"'
+                )
+                next_rf_seq = _next_seq(next_rf_seq)
+                continue
             forward_secured = forward_inner_payload is not route_payload
             if forward_secured and mesh_crypto is not None:
                 log(

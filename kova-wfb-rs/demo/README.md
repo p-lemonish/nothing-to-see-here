@@ -113,6 +113,8 @@ The simulated nodes are not dashboard-only objects in this mode. They are normal
 radio status heartbeats with their own logical sender IDs, sequence counters,
 positions, and batteries. If the physical transmitter stops, the real node and
 all simulated nodes advertised through it age out together.
+When `--sim-node` is used, the helper assumes the real node's `mesh_txrx.py`
+process controls channel hopping for the shared Wi-Fi interface.
 
 To make the helper follow the same channel-hopping schedule as the current mesh
 configs, add:

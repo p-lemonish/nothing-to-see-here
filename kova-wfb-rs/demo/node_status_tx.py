@@ -76,6 +76,7 @@ def _load_mesh_config(path: str | None) -> dict[str, object]:
         "label",
         "hop_channels",
         "channel_width",
+        "channel_control",
     ):
         if key in section:
             value = _optional_text(section.get(key))
@@ -355,6 +356,15 @@ def parse_args() -> argparse.Namespace:
         default=config_defaults.get("channel_agility", False),
         help="follow the same synchronized channel-hopping schedule as mesh_txrx.py",
     )
+    parser.add_argument(
+        "--channel-control",
+        choices=("own", "external"),
+        default=config_defaults.get("channel_control"),
+        help=(
+            "own changes the interface channel; external assumes another "
+            "process controls the shared interface"
+        ),
+    )
     parser.add_argument("--hop-channels", default=config_defaults.get("hop_channels", "36,40,48"))
     parser.add_argument("--channel-width", default=config_defaults.get("channel_width", "HT20"))
     parser.add_argument("--hop-slot-ms", type=int, default=config_defaults.get("hop_slot_ms", 5000))
@@ -378,7 +388,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    from wfb_rs_py import Tx
+    from wfb_rs_py import Tx, WfbRsError
     from wfb_rs_py.app_proto import (
         MSG_ROUTE_DATA,
         encode_frame,
@@ -452,6 +462,8 @@ def main() -> int:
         raise SystemExit(f"duplicate logical node IDs: {joined}")
     if args.mesh is None:
         args.mesh = bool(args.sim_node)
+    if args.channel_control is None:
+        args.channel_control = "external" if args.sim_node else "own"
     if args.sim_node and not args.mesh:
         print(
             "WARN --sim-node without --mesh sends direct logical sender IDs; "
@@ -479,18 +491,19 @@ def main() -> int:
     def switch_channel(channel: int, slot: int, next_hop_ms: int) -> None:
         nonlocal current_channel, tx_guard_until
         close_tx()
-        _set_channel(
-            iface=args.iface,
-            channel=channel,
-            width=args.channel_width,
-            down_up=args.channel_down_up,
-            settle_ms=args.channel_settle_ms,
-        )
-        open_tx()
+        if args.channel_control == "own":
+            _set_channel(
+                iface=args.iface,
+                channel=channel,
+                width=args.channel_width,
+                down_up=args.channel_down_up,
+                settle_ms=args.channel_settle_ms,
+            )
+            open_tx()
         current_channel = channel
         tx_guard_until = time.monotonic() + (args.channel_tx_guard_ms / 1000.0)
         print(
-            f"CHANNEL active iface={args.iface} channel={channel} "
+            f"CHANNEL {args.channel_control} iface={args.iface} channel={channel} "
             f"slot={slot} next_hop_ms={next_hop_ms}"
         )
 
@@ -523,13 +536,18 @@ def main() -> int:
                     switch_channel(channel, slot, next_hop_ms)
                     continue
 
-            if tx is None:
-                open_tx()
-
             now = time.monotonic()
             if now < tx_guard_until:
                 time.sleep(min(0.05, tx_guard_until - now))
                 continue
+
+            if tx is None:
+                try:
+                    open_tx()
+                except WfbRsError as exc:
+                    print(f'TX open_error error="{exc}"', file=sys.stderr)
+                    time.sleep(0.1)
+                    continue
 
             for node in nodes:
                 status = {
@@ -569,7 +587,17 @@ def main() -> int:
                         payload=payload,
                     )
 
-                tx.send(frame, seq=rf_seq)
+                try:
+                    tx.send(frame, seq=rf_seq)
+                except WfbRsError as exc:
+                    print(
+                        f'TX send_error node={node.node_id} seq={rf_seq} '
+                        f'error="{exc}"',
+                        file=sys.stderr,
+                    )
+                    close_tx()
+                    rf_seq = _next_seq(rf_seq)
+                    break
                 via = (
                     f" via={args.sender_id}"
                     if args.mesh and node.node_id != args.sender_id

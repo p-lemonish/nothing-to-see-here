@@ -101,6 +101,13 @@ def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
+def _status_node_id(status: dict[str, Any], fallback: int) -> int:
+    node_id = _coerce_int(status.get("id") or status.get("node_id"))
+    if node_id is None or not 1 <= node_id <= 255:
+        return fallback
+    return node_id
+
+
 def _next_seq(seq: int) -> int:
     seq = (seq + 1) & MAX_U32
     return 1 if seq == 0 else seq
@@ -416,9 +423,17 @@ class MeshState:
         payload_text = _safe_text(payload)
         status = parse_status_payload(payload)
         message = str(status.get("message") or message_type)
+        node_id = _status_node_id(status, origin_id)
+        physical_sender_id = _coerce_int(status.get("physical_sender_id"))
+        if physical_sender_id is not None and 1 <= physical_sender_id <= 255:
+            observed_via_id = physical_sender_id
+        else:
+            observed_via_id = via_id
+        if node_id == observed_via_id and origin_id != node_id:
+            observed_via_id = origin_id
 
         with self._lock:
-            node = self._ensure_node_locked(origin_id)
+            node = self._ensure_node_locked(node_id)
             label = status.get("label") or status.get("name")
             if label is not None:
                 node.label = str(label)
@@ -430,7 +445,7 @@ class MeshState:
             node.freq = freq
             node.bandwidth = bandwidth
             node.mcs_index = mcs_index
-            node.via = via_id
+            node.via = observed_via_id
             node.message = message
 
             x_value = _coerce_float(status.get("x"))
@@ -456,15 +471,16 @@ class MeshState:
             else:
                 self.stats.radio_packets += 1
 
-            self._touch_link_locked(BASE_NODE_ID, via_id, now, rssi, source)
-            if via_id != origin_id:
-                self._touch_link_locked(via_id, origin_id, now, rssi, source)
+            self._touch_link_locked(BASE_NODE_ID, observed_via_id, now, rssi, source)
+            if observed_via_id != node_id:
+                self._touch_link_locked(observed_via_id, node_id, now, rssi, source)
 
             self._append_event_locked(
                 {
                     "kind": "rx",
-                    "node": origin_id,
-                    "via": via_id,
+                    "node": node_id,
+                    "origin": origin_id,
+                    "via": observed_via_id,
                     "seq": seq,
                     "rssi": rssi,
                     "source": source,

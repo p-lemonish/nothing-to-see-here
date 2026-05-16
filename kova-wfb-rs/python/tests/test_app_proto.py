@@ -8,19 +8,30 @@ from wfb_rs_py.app_proto import (
     MSG_ROUTE_DATA,
     MSG_STATUS,
     MSG_SYNC,
+    ROUTE_SECURE_ASSOCIATED_DATA_SIZE,
     SECURE_PAYLOAD_SIZE,
     SEC_DOMAIN_MESH_GROUP,
+    STATUS_BATTERY_UNKNOWN,
+    STATUS_FLAG_CRYPTO_ENABLED,
+    STATUS_FLAG_DEGRADED_LINK,
+    STATUS_FLAG_FORWARDING_ENABLED,
+    STATUS_FLAG_LOW_BATTERY,
+    STATUS_PAYLOAD_SIZE,
+    STATUS_VERSION,
     SYNC_PAYLOAD_SIZE,
     ROUTE_DATA_PAYLOAD_SIZE,
     VERSION,
     decode_frame,
     decode_route_data_payload,
     decode_secure_payload,
+    decode_status_payload,
     decode_sync_payload,
     decrypt_secure_payload,
     encode_frame,
     encode_route_data_payload,
+    encode_route_secure_associated_data,
     encode_secure_payload,
+    encode_status_payload,
     encode_sync_payload,
     message_type_name,
     message_type_value,
@@ -258,6 +269,96 @@ def test_sync_message_type_is_known():
     assert message_type_name(MSG_SYNC) == "sync"
 
 
+def test_encode_decode_status_payload():
+    encoded = encode_status_payload(
+        uptime_s=12_345,
+        battery_pct=91,
+        peer_count=4,
+        flags=(
+            STATUS_FLAG_DEGRADED_LINK
+            | STATUS_FLAG_LOW_BATTERY
+            | STATUS_FLAG_CRYPTO_ENABLED
+            | STATUS_FLAG_FORWARDING_ENABLED
+        ),
+    )
+    status = decode_status_payload(encoded)
+
+    assert len(encoded) == STATUS_PAYLOAD_SIZE
+    assert status.status_version == STATUS_VERSION
+    assert status.uptime_s == 12_345
+    assert status.battery_pct == 91
+    assert status.peer_count == 4
+    assert status.flags == 0x0F
+    assert status.degraded_link is True
+    assert status.low_battery is True
+    assert status.crypto_enabled is True
+    assert status.forwarding_enabled is True
+
+
+def test_status_payload_allows_unknown_battery():
+    encoded = encode_status_payload(
+        uptime_s=1,
+        battery_pct=None,
+        peer_count=0,
+        flags=STATUS_FLAG_CRYPTO_ENABLED,
+    )
+    status = decode_status_payload(encoded)
+
+    assert encoded[5] == STATUS_BATTERY_UNKNOWN
+    assert status.battery_pct is None
+    assert status.crypto_enabled is True
+
+
+def test_status_payload_length_mismatch_is_invalid():
+    with pytest.raises(AppFrameError, match="status payload length mismatch"):
+        decode_status_payload(b"short")
+
+
+def test_status_payload_rejects_invalid_battery_pct():
+    with pytest.raises(AppFrameError, match="battery_pct must be in range"):
+        encode_status_payload(
+            uptime_s=1,
+            battery_pct=101,
+            peer_count=0,
+        )
+
+
+def test_status_payload_rejects_invalid_encoded_battery_pct():
+    tampered = bytearray(
+        encode_status_payload(
+            uptime_s=1,
+            battery_pct=50,
+            peer_count=0,
+        )
+    )
+    tampered[5] = 200
+
+    with pytest.raises(AppFrameError, match="status battery_pct must be in range"):
+        decode_status_payload(bytes(tampered))
+
+
+def test_status_payload_rejects_unsupported_version():
+    with pytest.raises(AppFrameError, match="unsupported status_version"):
+        encode_status_payload(
+            uptime_s=1,
+            battery_pct=90,
+            peer_count=1,
+            status_version=2,
+        )
+
+
+def test_encode_route_secure_associated_data():
+    aad = encode_route_secure_associated_data(
+        origin_sender_id=42,
+        destination_id=0,
+        ttl=2,
+        origin_seq=500,
+        inner_type="status",
+        inner_plaintext_len=STATUS_PAYLOAD_SIZE,
+    )
+    assert len(aad) == ROUTE_SECURE_ASSOCIATED_DATA_SIZE
+
+
 def test_encode_decode_decrypt_secure_payload():
     key = bytes(range(32))
     nonce = bytes(range(12))
@@ -300,6 +401,81 @@ def test_secure_payload_authenticates_associated_data():
 
     with pytest.raises(AppFrameError, match="authentication failed"):
         decrypt_secure_payload(secure, key=key, associated_data=b"bad-aad")
+
+
+def test_secure_status_roundtrip_with_route_associated_data():
+    key = bytes(range(32))
+    nonce = bytes(range(12))
+    status_plaintext = encode_status_payload(
+        uptime_s=999,
+        battery_pct=88,
+        peer_count=3,
+        flags=STATUS_FLAG_CRYPTO_ENABLED,
+    )
+    aad = encode_route_secure_associated_data(
+        origin_sender_id=7,
+        destination_id=0,
+        ttl=2,
+        origin_seq=100,
+        inner_type=MSG_STATUS,
+        inner_plaintext_len=len(status_plaintext),
+    )
+
+    encoded = encode_secure_payload(
+        key=key,
+        security_domain="mesh_group",
+        key_id=101,
+        key_epoch=1,
+        plaintext=status_plaintext,
+        associated_data=aad,
+        nonce=nonce,
+    )
+    secure = decode_secure_payload(encoded)
+    plaintext = decrypt_secure_payload(secure, key=key, associated_data=aad)
+    status = decode_status_payload(plaintext)
+
+    assert status.uptime_s == 999
+    assert status.battery_pct == 88
+    assert status.crypto_enabled is True
+
+
+def test_secure_status_rejects_tampered_route_associated_data():
+    key = bytes(range(32))
+    plaintext = encode_status_payload(
+        uptime_s=10,
+        battery_pct=90,
+        peer_count=2,
+        flags=STATUS_FLAG_CRYPTO_ENABLED,
+    )
+    aad = encode_route_secure_associated_data(
+        origin_sender_id=1,
+        destination_id=0,
+        ttl=2,
+        origin_seq=10,
+        inner_type="status",
+        inner_plaintext_len=len(plaintext),
+    )
+    tampered_aad = encode_route_secure_associated_data(
+        origin_sender_id=1,
+        destination_id=0,
+        ttl=1,
+        origin_seq=10,
+        inner_type="status",
+        inner_plaintext_len=len(plaintext),
+    )
+    encoded = encode_secure_payload(
+        key=key,
+        security_domain="mesh_group",
+        key_id=1,
+        key_epoch=1,
+        plaintext=plaintext,
+        associated_data=aad,
+        nonce=bytes(range(12)),
+    )
+    secure = decode_secure_payload(encoded)
+
+    with pytest.raises(AppFrameError, match="authentication failed"):
+        decrypt_secure_payload(secure, key=key, associated_data=tampered_aad)
 
 
 def test_secure_payload_rejects_short_wrapper():

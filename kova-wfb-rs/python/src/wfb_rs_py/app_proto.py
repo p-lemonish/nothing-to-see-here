@@ -36,6 +36,16 @@ ROUTE_DATA_PAYLOAD = struct.Struct("!BBBIBH")
 ROUTE_DATA_PAYLOAD_SIZE = ROUTE_DATA_PAYLOAD.size
 SYNC_PAYLOAD = struct.Struct("!QIHI")
 SYNC_PAYLOAD_SIZE = SYNC_PAYLOAD.size
+STATUS_VERSION = 1
+STATUS_PAYLOAD = struct.Struct("!BIBBB")
+STATUS_PAYLOAD_SIZE = STATUS_PAYLOAD.size
+STATUS_BATTERY_UNKNOWN = 0xFF
+STATUS_FLAG_DEGRADED_LINK = 0x01
+STATUS_FLAG_LOW_BATTERY = 0x02
+STATUS_FLAG_CRYPTO_ENABLED = 0x04
+STATUS_FLAG_FORWARDING_ENABLED = 0x08
+ROUTE_SECURE_ASSOCIATED_DATA = struct.Struct("!BBBIBH")
+ROUTE_SECURE_ASSOCIATED_DATA_SIZE = ROUTE_SECURE_ASSOCIATED_DATA.size
 SECURE_VERSION = 1
 SECURE_PAYLOAD = struct.Struct("!BBHI12s")
 SECURE_PAYLOAD_SIZE = SECURE_PAYLOAD.size
@@ -113,6 +123,31 @@ class SyncStatus:
     slot: int
     channel: int
     next_hop_ms: int
+
+
+@dataclass(frozen=True)
+class StatusPayload:
+    status_version: int
+    uptime_s: int
+    battery_pct: int | None
+    peer_count: int
+    flags: int
+
+    @property
+    def degraded_link(self) -> bool:
+        return bool(self.flags & STATUS_FLAG_DEGRADED_LINK)
+
+    @property
+    def low_battery(self) -> bool:
+        return bool(self.flags & STATUS_FLAG_LOW_BATTERY)
+
+    @property
+    def crypto_enabled(self) -> bool:
+        return bool(self.flags & STATUS_FLAG_CRYPTO_ENABLED)
+
+    @property
+    def forwarding_enabled(self) -> bool:
+        return bool(self.flags & STATUS_FLAG_FORWARDING_ENABLED)
 
 
 @dataclass(frozen=True)
@@ -322,6 +357,101 @@ def decode_sync_payload(payload: bytes) -> SyncStatus:
         slot=slot,
         channel=channel,
         next_hop_ms=next_hop_ms,
+    )
+
+
+def encode_status_payload(
+    *,
+    uptime_s: int,
+    battery_pct: int | None,
+    peer_count: int,
+    flags: int = 0,
+    status_version: int = STATUS_VERSION,
+) -> bytes:
+    _require_u8("status_version", status_version)
+    if status_version != STATUS_VERSION:
+        raise AppFrameError(f"unsupported status_version: {status_version}")
+    _require_u32("uptime_s", uptime_s)
+    _require_u8("peer_count", peer_count)
+    _require_u8("flags", flags)
+
+    encoded_battery_pct = STATUS_BATTERY_UNKNOWN
+    if battery_pct is not None:
+        if not 0 <= battery_pct <= 100:
+            raise AppFrameError(
+                "battery_pct must be in range 0..100 or None for unknown"
+            )
+        encoded_battery_pct = battery_pct
+
+    return STATUS_PAYLOAD.pack(
+        status_version,
+        uptime_s,
+        encoded_battery_pct,
+        peer_count,
+        flags,
+    )
+
+
+def decode_status_payload(payload: bytes) -> StatusPayload:
+    if len(payload) != STATUS_PAYLOAD_SIZE:
+        raise AppFrameError(
+            f"status payload length mismatch: expected={STATUS_PAYLOAD_SIZE} "
+            f"actual={len(payload)}"
+        )
+
+    status_version, uptime_s, battery_pct, peer_count, flags = STATUS_PAYLOAD.unpack(payload)
+    if status_version != STATUS_VERSION:
+        raise AppFrameError(f"unsupported status_version: {status_version}")
+
+    decoded_battery_pct: int | None
+    if battery_pct == STATUS_BATTERY_UNKNOWN:
+        decoded_battery_pct = None
+    elif 0 <= battery_pct <= 100:
+        decoded_battery_pct = battery_pct
+    else:
+        raise AppFrameError(
+            "status battery_pct must be in range 0..100 or "
+            f"{STATUS_BATTERY_UNKNOWN} for unknown, got {battery_pct}"
+        )
+
+    return StatusPayload(
+        status_version=status_version,
+        uptime_s=uptime_s,
+        battery_pct=decoded_battery_pct,
+        peer_count=peer_count,
+        flags=flags,
+    )
+
+
+def encode_route_secure_associated_data(
+    *,
+    origin_sender_id: int,
+    destination_id: int,
+    ttl: int,
+    origin_seq: int,
+    inner_type: str | int,
+    inner_plaintext_len: int,
+) -> bytes:
+    if origin_sender_id == 0:
+        raise AppFrameError("origin_sender_id 0 is reserved")
+    _require_u8("origin_sender_id", origin_sender_id)
+    _require_u8("destination_id", destination_id)
+    _require_u8("ttl", ttl)
+    _require_u32("origin_seq", origin_seq)
+    _require_u16("inner_plaintext_len", inner_plaintext_len)
+    msg_type = message_type_value(inner_type)
+    if msg_type == MSG_ROUTE_DATA:
+        raise AppFrameError("route_data cannot carry nested route_data")
+    if msg_type not in MESSAGE_TYPE_NAMES:
+        raise AppFrameError(f"unknown route secure inner_type: 0x{msg_type:02x}")
+
+    return ROUTE_SECURE_ASSOCIATED_DATA.pack(
+        origin_sender_id,
+        destination_id,
+        ttl,
+        origin_seq,
+        msg_type,
+        inner_plaintext_len,
     )
 
 

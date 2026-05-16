@@ -37,14 +37,7 @@ sudo iw dev "$NIC" set channel 36 HT20
 sudo iw dev "$NIC" set power_save off
 ```
 
-Run one process per peer (same WiFi channel + stream id, different sender ids):
-
-```bash
-sudo -E "$VIRTUAL_ENV/bin/python" python/examples/simple_txrx.py --iface "$NIC" --stream-id 1 --app-proto --sender-id 42 --message "hello 67" --message-type hello --count 0 --tx-interval-ms 1000
-sudo -E "$VIRTUAL_ENV/bin/python" python/examples/simple_txrx.py --iface "$NIC" --stream-id 1 --app-proto --sender-id 67 --message "hello 42" --message-type hello --count 0 --tx-interval-ms 1000
-```
-
-Optional: config-based mesh example:
+config-based mesh example:
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" python/examples/mesh_txrx.py --config configs/node1.ini

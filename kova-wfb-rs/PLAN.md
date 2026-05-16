@@ -313,6 +313,7 @@ Implementation order:
 4. Authenticated mesh forwarding.
 5. Optional compression.
 6. Structured status payloads.
+7. Channel-health metrics and channel agility.
 
 ### 1. Mesh Log Ergonomics
 
@@ -499,6 +500,92 @@ Later status fields:
 - retry/loss estimates
 - GPS/position if available
 
+### 7. Channel Agility
+
+Channel agility is relevant for availability, but it must be added carefully.
+Unsynchronized hopping can make the mesh worse by causing healthy nodes to miss
+each other. Automatic channel switching should happen only after authenticated
+control frames exist.
+
+Start with a conservative model:
+
+- fixed primary channel
+- backup channel list
+- shared hopping schedule
+- channel-health/jam score
+- channel blacklisting
+- rendezvous windows
+- emergency fallback channel
+- wide scan mode after prolonged silence
+
+Config shape:
+
+```ini
+channel_agility = false
+primary_channel = 36
+primary_width = HT20
+backup_channels = 40,44,48
+rendezvous_channel = 36
+emergency_channel = 36
+hop_slot_ms = 5000
+rendezvous_slot_ms = 1000
+lost_scan_dwell_ms = 1500
+jam_score_threshold = 10
+```
+
+Normal mode:
+
+- Use the best-known channel, normally `primary_channel`.
+- Keep sending normal mesh status/route traffic.
+- Track channel health from receive gaps, malformed frame rate, RSSI when
+  available, auth failures, and local packet counters.
+
+Degraded mode:
+
+- Enter when jam/loss score exceeds threshold.
+- Rotate through the pre-agreed `backup_channels` schedule.
+- Include periodic rendezvous windows on `rendezvous_channel`.
+- Send compact signed/encrypted "I am here" status packets during scheduled
+  slots.
+
+Lost mode:
+
+- Enter after prolonged silence from all expected peers.
+- Scan all allowed configured channels.
+- Listen longer than one full expected beacon/status interval per channel.
+- Transmit short authenticated presence packets only in scheduled slots.
+- Return to normal mode when authenticated peers are heard again.
+
+Example schedule:
+
+```text
+t0-t1: channel 36
+t1-t2: channel 40
+t2-t3: channel 44
+t3-t4: channel 48
+t4-t5: rendezvous channel 36
+repeat
+```
+
+Rules:
+
+- Do not automatically switch channels before AEAD authentication exists.
+- Do not accept unsigned channel-change instructions.
+- Keep an emergency rendezvous channel that every node knows.
+- Keep channel lists explicit in config and obey the local regulatory domain.
+- Prefer non-DFS channels for initial tests.
+- Log channel state transitions clearly.
+- If clocks are not synchronized, use longer rendezvous/listen windows.
+
+Implementation stages:
+
+1. Add passive channel-health metrics only; no switching.
+2. Add manual `--set-channel` helper or documented `iw` commands.
+3. Add config parsing for primary, backup, rendezvous, and emergency channels.
+4. Add authenticated channel-intent messages.
+5. Add degraded-mode scheduled hopping.
+6. Add lost-mode scan and rendezvous recovery.
+
 ## Next Implementation Steps
 
 1. Add `log_level` and `quiet_duplicates` to `mesh_txrx.py` and config files.
@@ -508,3 +595,5 @@ Later status fields:
 5. Ensure unauthenticated secure frames are dropped and not forwarded.
 6. Add optional compression after encryption works.
 7. Add structured status payloads after secure transport is stable.
+8. Add passive channel-health metrics.
+9. Add authenticated channel-agility controls and rendezvous behavior.

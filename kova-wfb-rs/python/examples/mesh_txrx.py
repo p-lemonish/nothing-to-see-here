@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import os
+import secrets
 import struct
 import subprocess
 import time
@@ -72,6 +73,10 @@ def _default_sender_id() -> int | None:
 def _next_seq(seq: int) -> int:
     seq = (seq + 1) & MAX_U32
     return 1 if seq == 0 else seq
+
+
+def _initial_seq() -> int:
+    return secrets.randbelow(MAX_U32) + 1
 
 
 def _parse_channel_list(value: object | None) -> list[int]:
@@ -560,7 +565,7 @@ def main() -> int:
     seen = SeenRoutes(args.seen_limit)
     secure_replay = ReplayWindow(mesh_replay_window)
     inner_payload = args.message.encode("utf-8") if args.message is not None else None
-    next_origin_seq = 1
+    next_origin_seq = _initial_seq()
     next_outer_seq = 1
     next_rf_seq = 1
     originated_count = 0

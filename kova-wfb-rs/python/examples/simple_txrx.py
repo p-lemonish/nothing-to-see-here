@@ -222,7 +222,7 @@ def main() -> int:
     parser.add_argument(
         "--message-type",
         default="text",
-        help="app protocol message type: hello, text, data, status, or numeric value",
+        help="app protocol message type: hello, text, data, status, sync, or numeric value",
     )
     args = parser.parse_args()
 
@@ -243,7 +243,7 @@ def main() -> int:
             parser.error(str(exc))
         if msg_type not in MESSAGE_TYPE_NAMES or msg_type == MSG_ROUTE_DATA:
             parser.error(
-                "--message-type must be one of hello, text, data, or status for app protocol mode"
+                "--message-type must be one of hello, text, data, status, or sync for app protocol mode"
             )
     else:
         msg_type = MSG_TEXT

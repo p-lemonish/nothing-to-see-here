@@ -271,8 +271,10 @@ sudo -E "$VIRTUAL_ENV/bin/python" python/examples/mesh_txrx.py --config configs/
 ```
 
 The starter configs enable experimental synchronized channel hopping across
-channels `36,40,48` with 5-second slots. To hold a node on its current channel
-while debugging, add `--no-channel-agility`:
+channels `36,40,48` with 5-second slots, anchored to Unix UTC time
+(`hop_epoch_ms = 0`). They also send compact `sync` heartbeats every 5 seconds
+so logs show clock skew, slot agreement, and channel agreement between nodes.
+To hold a node on its current channel while debugging, add `--no-channel-agility`:
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" python/examples/mesh_txrx.py \

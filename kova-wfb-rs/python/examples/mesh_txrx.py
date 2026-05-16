@@ -7,6 +7,7 @@ import os
 import subprocess
 import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Deque
 
@@ -14,15 +15,27 @@ from wfb_rs_py import Rx, Tx
 from wfb_rs_py.app_proto import (
     AppFrameError,
     MSG_ROUTE_DATA,
+    MSG_SYNC,
     decode_frame,
     decode_route_data_payload,
+    decode_sync_payload,
     encode_frame,
     encode_route_data_payload,
+    encode_sync_payload,
     message_type_value,
 )
 
 MAX_U32 = 0xFFFF_FFFF
 CONFIG_SECTION = "mesh"
+
+
+@dataclass(frozen=True)
+class ScheduleState:
+    utc_ms: int
+    slot: int
+    slot_elapsed_ms: int
+    channel: int
+    next_hop_ms: int
 
 
 def _default_iface() -> str | None:
@@ -52,6 +65,33 @@ def _parse_channel_list(value: object | None) -> list[int]:
         if text:
             channels.append(int(text, 0))
     return channels
+
+
+def _utc_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _ntp_sync_status() -> str:
+    try:
+        result = subprocess.run(
+            ["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unavailable"
+
+    if result.returncode != 0:
+        return "unavailable"
+    value = result.stdout.strip().lower()
+    if value in {"yes", "true", "1"}:
+        return "yes"
+    if value in {"no", "false", "0"}:
+        return "no"
+    return "unknown"
 
 
 def _run_privileged(cmd: list[str]) -> None:
@@ -91,10 +131,22 @@ def _set_channel(
         time.sleep(settle_ms / 1000.0)
 
 
-def _scheduled_channel(channels: list[int], slot_ms: int, epoch_ms: int) -> int:
-    now_ms = int(time.time() * 1000)
-    slot = max(0, now_ms - epoch_ms) // slot_ms
-    return channels[slot % len(channels)]
+def _schedule_state(
+    channels: list[int],
+    slot_ms: int,
+    epoch_ms: int,
+) -> ScheduleState:
+    now_ms = _utc_ms()
+    elapsed_ms = max(0, now_ms - epoch_ms)
+    slot = elapsed_ms // slot_ms
+    slot_elapsed_ms = elapsed_ms % slot_ms
+    return ScheduleState(
+        utc_ms=now_ms,
+        slot=slot,
+        slot_elapsed_ms=slot_elapsed_ms,
+        channel=channels[slot % len(channels)],
+        next_hop_ms=slot_ms - slot_elapsed_ms,
+    )
 
 
 def _optional_text(value: str | None) -> str | None:
@@ -116,7 +168,11 @@ def _load_config(path: str | None) -> dict[str, object]:
 
     parser = configparser.ConfigParser(interpolation=None)
     parser.read(config_path)
-    section = parser[CONFIG_SECTION] if parser.has_section(CONFIG_SECTION) else parser["DEFAULT"]
+    section = (
+        parser[CONFIG_SECTION]
+        if parser.has_section(CONFIG_SECTION)
+        else parser["DEFAULT"]
+    )
 
     out: dict[str, object] = {}
     for key in (
@@ -143,11 +199,19 @@ def _load_config(path: str | None) -> dict[str, object]:
         "hop_slot_ms",
         "hop_epoch_ms",
         "channel_settle_ms",
+        "channel_tx_guard_ms",
+        "sync_interval_ms",
     ):
         if key in section:
             out[key] = int(section[key], 0)
 
-    for key in ("print_rssi", "include_self", "channel_agility", "channel_down_up"):
+    for key in (
+        "print_rssi",
+        "include_self",
+        "channel_agility",
+        "channel_down_up",
+        "sync_heartbeat",
+    ):
         if key in section:
             out[key] = section.getboolean(key)
 
@@ -303,10 +367,28 @@ def main() -> int:
         help="delay after each channel change before reopening radio handles",
     )
     parser.add_argument(
+        "--channel-tx-guard-ms",
+        type=int,
+        default=config_defaults.get("channel_tx_guard_ms", 250),
+        help="listen-only guard time after channel changes before originating packets",
+    )
+    parser.add_argument(
         "--channel-down-up",
         action=argparse.BooleanOptionalAction,
         default=config_defaults.get("channel_down_up", True),
         help="bring the interface down/up around each channel change",
+    )
+    parser.add_argument(
+        "--sync-heartbeat",
+        action=argparse.BooleanOptionalAction,
+        default=config_defaults.get("sync_heartbeat", False),
+        help="send compact routed sync heartbeats with UTC time, slot, and channel",
+    )
+    parser.add_argument(
+        "--sync-interval-ms",
+        type=int,
+        default=config_defaults.get("sync_interval_ms", 5000),
+        help="interval between sync heartbeat packets",
     )
     args = parser.parse_args()
 
@@ -340,6 +422,10 @@ def main() -> int:
             parser.error("--hop-slot-ms must be > 0")
         if args.channel_settle_ms < 0:
             parser.error("--channel-settle-ms must be >= 0")
+    if args.channel_tx_guard_ms < 0:
+        parser.error("--channel-tx-guard-ms must be >= 0")
+    if args.sync_interval_ms <= 0:
+        parser.error("--sync-interval-ms must be > 0")
 
     try:
         inner_type = message_type_value(args.message_type)
@@ -347,6 +433,8 @@ def main() -> int:
         parser.error(str(exc))
     if inner_type == MSG_ROUTE_DATA:
         parser.error("--message-type cannot be route_data")
+    if inner_type == MSG_SYNC:
+        parser.error("--message-type sync is reserved for --sync-heartbeat")
 
     seen = SeenRoutes(args.seen_limit)
     inner_payload = args.message.encode("utf-8") if args.message is not None else None
@@ -355,6 +443,8 @@ def main() -> int:
     next_rf_seq = 1
     originated_count = 0
     next_tx_at = time.monotonic()
+    next_sync_at = time.monotonic()
+    tx_guard_until = 0.0
     current_channel: int | None = None
     tx: Tx | None = None
     rx: Rx | None = None
@@ -386,24 +476,91 @@ def main() -> int:
             tx = None
             raise
 
-    def switch_channel(channel: int) -> None:
-        nonlocal current_channel
+    def current_schedule_state() -> ScheduleState | None:
+        if not args.channel_agility:
+            return None
+        return _schedule_state(hop_channels, args.hop_slot_ms, args.hop_epoch_ms)
+
+    def send_route(
+        *,
+        inner_type: int,
+        payload: bytes,
+        destination_id: int,
+        ttl: int,
+    ) -> int:
+        nonlocal next_origin_seq, next_outer_seq, next_rf_seq
+        if tx is None:
+            raise RuntimeError("TX handle is not open")
+
+        seq_sent = next_origin_seq
+        route_payload = encode_route_data_payload(
+            origin_sender_id=args.sender_id,
+            destination_id=destination_id,
+            ttl=ttl,
+            origin_seq=seq_sent,
+            inner_type=inner_type,
+            inner_payload=payload,
+        )
+        frame = _encode_outer_route_frame(
+            sender_id=args.sender_id,
+            app_seq=next_outer_seq,
+            route_payload=route_payload,
+        )
+        tx.send(frame, seq=next_rf_seq)
+        seen.remember((args.sender_id, seq_sent))
+        next_origin_seq = _next_seq(next_origin_seq)
+        next_outer_seq = _next_seq(next_outer_seq)
+        next_rf_seq = _next_seq(next_rf_seq)
+        return seq_sent
+
+    def build_sync_payload() -> tuple[bytes, ScheduleState | None]:
+        state = current_schedule_state()
+        if state is None:
+            return (
+                encode_sync_payload(
+                    utc_ms=_utc_ms(),
+                    slot=0,
+                    channel=current_channel or 0,
+                    next_hop_ms=0,
+                ),
+                None,
+            )
+
+        return (
+            encode_sync_payload(
+                utc_ms=state.utc_ms,
+                slot=state.slot,
+                channel=state.channel,
+                next_hop_ms=state.next_hop_ms,
+            ),
+            state,
+        )
+
+    def switch_channel(state: ScheduleState) -> None:
+        nonlocal current_channel, tx_guard_until
         close_radio()
         _set_channel(
             iface=args.iface,
-            channel=channel,
+            channel=state.channel,
             width=args.channel_width,
             down_up=args.channel_down_up,
             settle_ms=args.channel_settle_ms,
         )
         open_radio()
-        current_channel = channel
-        log(f"CHANNEL active iface={args.iface} width={args.channel_width}")
+        current_channel = state.channel
+        tx_guard_until = time.monotonic() + (args.channel_tx_guard_ms / 1000.0)
+        log(
+            f"CHANNEL active iface={args.iface} width={args.channel_width} "
+            f"utc_ms={state.utc_ms} slot={state.slot} "
+            f"next_hop_ms={state.next_hop_ms} tx_guard_ms={args.channel_tx_guard_ms}"
+        )
+
+    ntp_status = _ntp_sync_status()
 
     try:
         if args.channel_agility:
             switch_channel(
-                _scheduled_channel(hop_channels, args.hop_slot_ms, args.hop_epoch_ms)
+                _schedule_state(hop_channels, args.hop_slot_ms, args.hop_epoch_ms)
             )
         else:
             open_radio()
@@ -414,53 +571,80 @@ def main() -> int:
             f"Mesh UDP mode: sender={args.sender_id} ttl={args.ttl} "
             f"dest={args.destination_id}{agility_desc}, Ctrl-C to exit"
         )
+        state = current_schedule_state()
+        if state is not None:
+            log(
+                f"CLOCK source=unix_utc ntp_synced={ntp_status} "
+                f"utc_ms={state.utc_ms} hop_epoch_ms={args.hop_epoch_ms} "
+                f"slot_ms={args.hop_slot_ms} slot={state.slot} "
+                f"next_hop_ms={state.next_hop_ms}"
+            )
+        else:
+            log(
+                f"CLOCK source=unix_utc ntp_synced={ntp_status} "
+                f"utc_ms={_utc_ms()} schedule=off"
+            )
 
         while True:
-            if args.channel_agility:
-                desired_channel = _scheduled_channel(
-                    hop_channels,
-                    args.hop_slot_ms,
-                    args.hop_epoch_ms,
-                )
-                if desired_channel != current_channel:
-                    switch_channel(desired_channel)
+            state = current_schedule_state()
+            if state is not None:
+                if state.channel != current_channel:
+                    switch_channel(state)
                     continue
 
             if tx is None or rx is None:
                 raise RuntimeError("radio handles are not open")
 
             now = time.monotonic()
+            tx_allowed = now >= tx_guard_until
             should_originate = (
                 inner_payload is not None
                 and (args.count == 0 or originated_count < args.count)
                 and now >= next_tx_at
+                and tx_allowed
             )
             if should_originate:
-                route_payload = encode_route_data_payload(
-                    origin_sender_id=args.sender_id,
+                sent_seq = send_route(
+                    inner_type=inner_type,
+                    payload=inner_payload,
                     destination_id=args.destination_id,
                     ttl=args.ttl,
-                    origin_seq=next_origin_seq,
-                    inner_type=inner_type,
-                    inner_payload=inner_payload,
                 )
-                frame = _encode_outer_route_frame(
-                    sender_id=args.sender_id,
-                    app_seq=next_outer_seq,
-                    route_payload=route_payload,
-                )
-                tx.send(frame, seq=next_rf_seq)
-                seen.remember((args.sender_id, next_origin_seq))
                 log(
-                    f"TX route origin={args.sender_id} seq={next_origin_seq} "
+                    f"TX route origin={args.sender_id} seq={sent_seq} "
                     f"dest={args.destination_id} ttl={args.ttl} "
                     f"type={args.message_type} len={len(inner_payload)}"
                 )
-                next_origin_seq = _next_seq(next_origin_seq)
-                next_outer_seq = _next_seq(next_outer_seq)
-                next_rf_seq = _next_seq(next_rf_seq)
                 originated_count += 1
                 next_tx_at = now + (args.tx_interval_ms / 1000.0)
+
+            should_sync = (
+                args.sync_heartbeat
+                and now >= next_sync_at
+                and tx_allowed
+            )
+            if should_sync:
+                sync_payload, sync_state = build_sync_payload()
+                sent_seq = send_route(
+                    inner_type=MSG_SYNC,
+                    payload=sync_payload,
+                    destination_id=0,
+                    ttl=args.ttl,
+                )
+                if sync_state is None:
+                    log(
+                        f"TX sync origin={args.sender_id} seq={sent_seq} "
+                        f"dest=0 ttl={args.ttl} utc_ms={_utc_ms()} "
+                        f"slot=0 channel={current_channel or 0} next_hop_ms=0"
+                    )
+                else:
+                    log(
+                        f"TX sync origin={args.sender_id} seq={sent_seq} "
+                        f"dest=0 ttl={args.ttl} utc_ms={sync_state.utc_ms} "
+                        f"slot={sync_state.slot} channel={sync_state.channel} "
+                        f"next_hop_ms={sync_state.next_hop_ms}"
+                    )
+                next_sync_at = now + (args.sync_interval_ms / 1000.0)
 
             result = rx.recv_optional(timeout_ms=args.rx_timeout_ms)
             if result is None:
@@ -513,13 +697,42 @@ def main() -> int:
                 )
 
             if delivered:
-                text = route.inner_payload.decode("utf-8", errors="replace")
-                log(
-                    f'RX deliver via={frame.sender_id} '
-                    f'origin={route.origin_sender_id} seq={route.origin_seq} '
-                    f'dest={route.destination_id} ttl={route.ttl} '
-                    f'type={route.inner_type_name} payload="{text}"{suffix}'
-                )
+                if route.inner_type == MSG_SYNC:
+                    try:
+                        sync = decode_sync_payload(route.inner_payload)
+                    except AppFrameError as exc:
+                        log(
+                            f'RX invalid_sync via={frame.sender_id} '
+                            f'origin={route.origin_sender_id} seq={route.origin_seq} '
+                            f'len={len(route.inner_payload)} error="{exc}"'
+                        )
+                    else:
+                        local_state = current_schedule_state()
+                        local_channel = current_channel or 0
+                        if local_state is None:
+                            local_slot = "?"
+                            slot_delta = "?"
+                        else:
+                            local_slot = str(local_state.slot)
+                            slot_delta = str(local_state.slot - sync.slot)
+                        log(
+                            f"RX sync via={frame.sender_id} "
+                            f"origin={route.origin_sender_id} seq={route.origin_seq} "
+                            f"utc_ms={sync.utc_ms} skew_ms={_utc_ms() - sync.utc_ms} "
+                            f"slot={sync.slot} local_slot={local_slot} "
+                            f"slot_delta={slot_delta} channel={sync.channel} "
+                            f"local_channel={local_channel} "
+                            f"channel_match={int(local_channel == sync.channel)} "
+                            f"next_hop_ms={sync.next_hop_ms}{suffix}"
+                        )
+                else:
+                    text = route.inner_payload.decode("utf-8", errors="replace")
+                    log(
+                        f'RX deliver via={frame.sender_id} '
+                        f'origin={route.origin_sender_id} seq={route.origin_seq} '
+                        f'dest={route.destination_id} ttl={route.ttl} '
+                        f'type={route.inner_type_name} payload="{text}"{suffix}'
+                    )
             else:
                 log(
                     f"RX transit via={frame.sender_id} "

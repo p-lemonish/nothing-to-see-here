@@ -6,12 +6,16 @@ from wfb_rs_py.app_proto import (
     MSG_HELLO,
     MSG_ROUTE_DATA,
     MSG_STATUS,
+    MSG_SYNC,
+    SYNC_PAYLOAD_SIZE,
     ROUTE_DATA_PAYLOAD_SIZE,
     VERSION,
     decode_frame,
     decode_route_data_payload,
+    decode_sync_payload,
     encode_frame,
     encode_route_data_payload,
+    encode_sync_payload,
     message_type_name,
     message_type_value,
 )
@@ -217,3 +221,30 @@ def test_route_data_cannot_nest_route_data():
 def test_route_data_message_type_is_known():
     assert message_type_value("route_data") == MSG_ROUTE_DATA
     assert message_type_name(MSG_ROUTE_DATA) == "route_data"
+
+
+def test_encode_decode_sync_payload():
+    encoded = encode_sync_payload(
+        utc_ms=1_789_549_123_456,
+        slot=357_909_824,
+        channel=36,
+        next_hop_ms=4321,
+    )
+
+    sync = decode_sync_payload(encoded)
+
+    assert len(encoded) == SYNC_PAYLOAD_SIZE
+    assert sync.utc_ms == 1_789_549_123_456
+    assert sync.slot == 357_909_824
+    assert sync.channel == 36
+    assert sync.next_hop_ms == 4321
+
+
+def test_sync_payload_length_mismatch_is_invalid():
+    with pytest.raises(AppFrameError, match="sync payload length mismatch"):
+        decode_sync_payload(b"short")
+
+
+def test_sync_message_type_is_known():
+    assert message_type_value("sync") == MSG_SYNC
+    assert message_type_name(MSG_SYNC) == "sync"

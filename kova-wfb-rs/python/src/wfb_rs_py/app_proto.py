@@ -9,11 +9,13 @@ HEADER_SIZE = HEADER.size
 MAX_U8 = 0xFF
 MAX_U16 = 0xFFFF
 MAX_U32 = 0xFFFF_FFFF
+MAX_U64 = 0xFFFF_FFFF_FFFF_FFFF
 
 MSG_HELLO = 0x01
 MSG_TEXT = 0x02
 MSG_DATA = 0x03
 MSG_STATUS = 0x04
+MSG_SYNC = 0x05
 MSG_ROUTE_DATA = 0x21
 
 MESSAGE_TYPES: dict[str, int] = {
@@ -21,12 +23,15 @@ MESSAGE_TYPES: dict[str, int] = {
     "text": MSG_TEXT,
     "data": MSG_DATA,
     "status": MSG_STATUS,
+    "sync": MSG_SYNC,
     "route_data": MSG_ROUTE_DATA,
 }
 
 MESSAGE_TYPE_NAMES = {value: name for name, value in MESSAGE_TYPES.items()}
 ROUTE_DATA_PAYLOAD = struct.Struct("!BBBIBH")
 ROUTE_DATA_PAYLOAD_SIZE = ROUTE_DATA_PAYLOAD.size
+SYNC_PAYLOAD = struct.Struct("!QIHI")
+SYNC_PAYLOAD_SIZE = SYNC_PAYLOAD.size
 
 
 class AppFrameError(ValueError):
@@ -77,14 +82,32 @@ class RouteData:
         )
 
 
+@dataclass(frozen=True)
+class SyncStatus:
+    utc_ms: int
+    slot: int
+    channel: int
+    next_hop_ms: int
+
+
 def _require_u8(name: str, value: int) -> None:
     if not 0 <= value <= MAX_U8:
         raise AppFrameError(f"{name} must fit in u8: {value}")
 
 
+def _require_u16(name: str, value: int) -> None:
+    if not 0 <= value <= MAX_U16:
+        raise AppFrameError(f"{name} must fit in u16: {value}")
+
+
 def _require_u32(name: str, value: int) -> None:
     if not 0 <= value <= MAX_U32:
         raise AppFrameError(f"{name} must fit in u32: {value}")
+
+
+def _require_u64(name: str, value: int) -> None:
+    if not 0 <= value <= MAX_U64:
+        raise AppFrameError(f"{name} must fit in u64: {value}")
 
 
 def message_type_value(value: str | int) -> int:
@@ -201,6 +224,36 @@ def decode_route_data_payload(payload: bytes) -> RouteData:
         origin_seq=origin_seq,
         inner_type=inner_type,
         inner_payload=inner_payload,
+    )
+
+
+def encode_sync_payload(
+    *,
+    utc_ms: int,
+    slot: int,
+    channel: int,
+    next_hop_ms: int,
+) -> bytes:
+    _require_u64("utc_ms", utc_ms)
+    _require_u32("slot", slot)
+    _require_u16("channel", channel)
+    _require_u32("next_hop_ms", next_hop_ms)
+    return SYNC_PAYLOAD.pack(utc_ms, slot, channel, next_hop_ms)
+
+
+def decode_sync_payload(payload: bytes) -> SyncStatus:
+    if len(payload) != SYNC_PAYLOAD_SIZE:
+        raise AppFrameError(
+            f"sync payload length mismatch: expected={SYNC_PAYLOAD_SIZE} "
+            f"actual={len(payload)}"
+        )
+
+    utc_ms, slot, channel, next_hop_ms = SYNC_PAYLOAD.unpack(payload)
+    return SyncStatus(
+        utc_ms=utc_ms,
+        slot=slot,
+        channel=channel,
+        next_hop_ms=next_hop_ms,
     )
 
 

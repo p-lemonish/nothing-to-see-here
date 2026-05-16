@@ -64,6 +64,7 @@ Active message types:
 0x02 = text
 0x03 = data
 0x04 = status
+0x05 = sync
 0x21 = route_data
 ```
 
@@ -108,6 +109,9 @@ frames during debugging.
   configs. Set each `iface` from `iw dev`.
 - `python/examples/mesh_txrx.py` supports experimental synchronized channel
   hopping via `channel_agility`, `hop_channels`, and `hop_slot_ms`.
+- `python/examples/mesh_txrx.py` uses Unix UTC time for the hop schedule,
+  prints clock/schedule state, applies a TX guard after channel changes, and can
+  send compact `sync` heartbeats for clock/slot/channel observability.
 - No ACK/retry/session example is implemented.
 
 ## Node-To-Node Test
@@ -598,13 +602,31 @@ channel_width = HT20
 hop_slot_ms = 5000
 hop_epoch_ms = 0
 channel_settle_ms = 250
+channel_tx_guard_ms = 250
 channel_down_up = true
+sync_heartbeat = true
+sync_interval_ms = 5000
 ```
 
-All nodes use wall-clock time to pick the same channel slot. During a switch,
-`mesh_txrx.py` closes its radio handles, changes the interface channel, reopens
-the handles, and resumes UDP-like send/receive. Packets lost during the switch
-are accepted as normal UDP-like loss.
+All nodes use Unix UTC wall-clock time to pick the same channel slot. During a
+switch, `mesh_txrx.py` closes its radio handles, changes the interface channel,
+reopens the handles, waits through a short TX guard window, and resumes
+UDP-like send/receive. Packets lost during the switch are accepted as normal
+UDP-like loss.
+
+The `sync` heartbeat payload is 18 bytes:
+
+```text
+offset  size  field
+0       8     utc_ms
+8       4     slot
+12      2     channel
+14      4     next_hop_ms
+```
+
+Received sync logs compare the peer's UTC time, slot, and channel against the
+local node. This does not discipline the local clock; NTP is still the clock
+source.
 
 ## Next Implementation Steps
 
@@ -615,6 +637,6 @@ are accepted as normal UDP-like loss.
 5. Ensure unauthenticated secure frames are dropped and not forwarded.
 6. Add optional compression after encryption works.
 7. Add structured status payloads after secure transport is stable.
-8. Test fixed-schedule channel hopping across three nodes.
+8. Test fixed-schedule channel hopping and sync heartbeats across three nodes.
 9. Add passive channel-health metrics.
 10. Add authenticated channel-agility controls and rendezvous behavior.

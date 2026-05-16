@@ -28,10 +28,13 @@ from wfb_rs_py.app_proto import (
     AppFrameError,
     CHACHA20_POLY1305_KEY_SIZE,
     MSG_DATA,
+    MSG_ROUTE_ADV,
     MSG_ROUTE_DATA,
     MSG_ROUTE_V2,
     MSG_STATUS,
     MSG_SYNC,
+    ROUTE_ADV_UNREACHABLE_COST,
+    ROUTE_ADV_UNREACHABLE_HOPS,
     SEC_DOMAIN_C2_TO_NODE,
     SEC_DOMAIN_MESH_GROUP,
     SEC_DOMAIN_NODE_TO_C2,
@@ -41,6 +44,7 @@ from wfb_rs_py.app_proto import (
     address_type_name,
     address_type_value,
     decode_frame,
+    decode_route_adv_payload,
     decode_route_data_payload,
     decode_route_v2_payload,
     decode_secure_payload,
@@ -48,6 +52,7 @@ from wfb_rs_py.app_proto import (
     decode_sync_payload,
     decrypt_secure_payload,
     encode_frame,
+    encode_route_adv_payload,
     encode_route_data_payload,
     encode_route_v2_e2e_associated_data,
     encode_route_v2_payload,
@@ -575,6 +580,7 @@ def _load_config(path: str | None) -> dict[str, object]:
         "message_file_reload",
         "status_auto",
         "local_control_enabled",
+        "is_base",
     ):
         if key in section:
             out[key] = section.getboolean(key)
@@ -714,6 +720,43 @@ class ReplayWindow:
             old = self._order.popleft()
             self._seen.discard(old)
         return True
+
+
+def _link_cost(rssi: float) -> int:
+    return max(1, min(100, int(-rssi - 20)))
+
+
+class RoutingTable:
+    def __init__(self, is_base: bool):
+        self._is_base = is_base
+        self._entries: dict[int, tuple[int, int, float]] = {}
+
+    def update(self, neighbor_id: int, cost: int, hops: int, now: float) -> None:
+        self._entries[neighbor_id] = (cost, hops, now)
+
+    def my_cost_to_base(self) -> int:
+        if self._is_base:
+            return 0
+        entry = self._best_entry()
+        return entry[0] if entry is not None else ROUTE_ADV_UNREACHABLE_COST
+
+    def my_hops_to_base(self) -> int:
+        if self._is_base:
+            return 0
+        entry = self._best_entry()
+        return entry[1] if entry is not None else ROUTE_ADV_UNREACHABLE_HOPS
+
+    def _best_entry(self) -> tuple[int, int] | None:
+        reachable = [
+            (c, h) for c, h, _ in self._entries.values()
+            if c < ROUTE_ADV_UNREACHABLE_COST
+        ]
+        return min(reachable, key=lambda x: (x[0], x[1])) if reachable else None
+
+    def prune_stale(self, now: float, ttl_s: float = 10.0) -> None:
+        stale = [k for k, (_, __, t) in self._entries.items() if t < now - ttl_s]
+        for k in stale:
+            del self._entries[k]
 
 
 def _encode_outer_route_frame(
@@ -1048,6 +1091,12 @@ def main() -> int:
         type=lambda value: int(value, 0),
         default=config_defaults.get("c2_uplink_start_counter", 1),
     )
+    parser.add_argument(
+        "--is-base",
+        action=argparse.BooleanOptionalAction,
+        default=config_defaults.get("is_base", False),
+        help="this node is the base station; advertises cost=0/hops=0 in route_adv",
+    )
     args = parser.parse_args()
 
     if not args.iface:
@@ -1178,7 +1227,7 @@ def main() -> int:
         inner_type = message_type_value(args.message_type)
     except AppFrameError as exc:
         parser.error(str(exc))
-    if inner_type in {MSG_ROUTE_DATA, MSG_ROUTE_V2}:
+    if inner_type in {MSG_ROUTE_DATA, MSG_ROUTE_V2, MSG_ROUTE_ADV}:
         parser.error("--message-type cannot be a route packet type")
     if inner_type == MSG_SYNC:
         parser.error("--message-type sync is reserved for --sync-heartbeat")
@@ -1404,6 +1453,9 @@ def main() -> int:
         rtb_after_ms=args.link_rtb_after_ms,
         recovery_hold_ms=args.link_recovery_hold_ms,
     )
+    routing_table = RoutingTable(args.is_base)
+    _peer_rssi: dict[int, float] = {}
+    next_route_adv_at = time.monotonic()
     started_at = time.monotonic()
     next_origin_seq = _initial_seq()
     next_outer_seq = 1
@@ -2227,11 +2279,16 @@ def main() -> int:
                             f"ok={int(ok)} detail=\"{detail}\""
                         )
                 else:
+                    effective_ttl = args.ttl
+                    if not args.is_base:
+                        my_hops = routing_table.my_hops_to_base()
+                        if my_hops < ROUTE_ADV_UNREACHABLE_HOPS:
+                            effective_ttl = min(args.ttl, my_hops + 1)
                     sent_seq, secured = send_route(
                         inner_type=inner_type,
                         payload=origin_payload,
                         destination_id=args.destination_id,
-                        ttl=args.ttl,
+                        ttl=effective_ttl,
                     )
                     if secured and mesh_crypto is not None:
                         log(
@@ -2277,6 +2334,31 @@ def main() -> int:
                     )
                 next_sync_at = now + (args.sync_interval_ms / 1000.0)
 
+            should_route_adv = now >= next_route_adv_at and tx_allowed
+            if should_route_adv:
+                routing_table.prune_stale(now)
+                adv_cost = routing_table.my_cost_to_base()
+                adv_hops = routing_table.my_hops_to_base()
+                adv_payload = encode_route_adv_payload(
+                    cost_to_base=adv_cost,
+                    hops_to_base=adv_hops,
+                )
+                try:
+                    sent_seq, _ = send_route(
+                        inner_type=MSG_ROUTE_ADV,
+                        payload=adv_payload,
+                        destination_id=0,
+                        ttl=0,
+                    )
+                except (AppFrameError, ValueError) as exc:
+                    log(f'ROUTE_ADV send_error="{exc}"')
+                else:
+                    log(
+                        f"TX route_adv origin={args.sender_id} seq={sent_seq} "
+                        f"cost={adv_cost} hops={adv_hops}"
+                    )
+                next_route_adv_at = now + (args.tx_interval_ms / 1000.0)
+
             result = rx.recv_optional(timeout_ms=args.rx_timeout_ms)
             if result is None:
                 continue
@@ -2302,6 +2384,8 @@ def main() -> int:
                     continue
 
                 link_health.note_peer(frame.sender_id, time.monotonic())
+                prev_rssi = _peer_rssi.get(frame.sender_id, float(meta.rssi[0]))
+                _peer_rssi[frame.sender_id] = prev_rssi * 0.7 + meta.rssi[0] * 0.3
                 origin_label = _addr_label(route_v2.origin_type, route_v2.origin_id)
                 dest_label = _addr_label(
                     route_v2.destination_type,
@@ -2436,6 +2520,8 @@ def main() -> int:
                 continue
 
             link_health.note_peer(frame.sender_id, time.monotonic())
+            prev_rssi = _peer_rssi.get(frame.sender_id, float(meta.rssi[0]))
+            _peer_rssi[frame.sender_id] = prev_rssi * 0.7 + meta.rssi[0] * 0.3
 
             if route.origin_sender_id == args.sender_id:
                 seen.remember(route.dedupe_key)
@@ -2532,6 +2618,38 @@ def main() -> int:
                             f"crypto={int(status.crypto_enabled)} "
                             f"forwarding={int(status.forwarding_enabled)}"
                             f"{suffix}"
+                        )
+                elif route.inner_type == MSG_ROUTE_ADV:
+                    try:
+                        adv = decode_route_adv_payload(route_payload)
+                    except AppFrameError as exc:
+                        log(
+                            f'RX invalid_route_adv via={frame.sender_id} '
+                            f'origin={route.origin_sender_id} seq={route.origin_seq} '
+                            f'len={len(route_payload)} error="{exc}"'
+                        )
+                    else:
+                        neighbor_rssi = _peer_rssi.get(frame.sender_id, -80.0)
+                        link_c = _link_cost(neighbor_rssi)
+                        if adv.cost_to_base >= ROUTE_ADV_UNREACHABLE_COST:
+                            via_cost = ROUTE_ADV_UNREACHABLE_COST
+                            via_hops = ROUTE_ADV_UNREACHABLE_HOPS
+                        else:
+                            via_cost = min(
+                                ROUTE_ADV_UNREACHABLE_COST - 1,
+                                adv.cost_to_base + link_c,
+                            )
+                            via_hops = min(
+                                ROUTE_ADV_UNREACHABLE_HOPS - 1,
+                                adv.hops_to_base + 1,
+                            )
+                        routing_table.update(frame.sender_id, via_cost, via_hops, now)
+                        log(
+                            f"RX route_adv via={frame.sender_id} "
+                            f"origin={route.origin_sender_id} "
+                            f"cost_adv={adv.cost_to_base} hops_adv={adv.hops_to_base} "
+                            f"my_cost={routing_table.my_cost_to_base()} "
+                            f"my_hops={routing_table.my_hops_to_base()}"
                         )
                 else:
                     if route_secured:

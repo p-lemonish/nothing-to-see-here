@@ -22,6 +22,7 @@ MSG_STATUS = 0x04
 MSG_SYNC = 0x05
 MSG_ROUTE_DATA = 0x21
 MSG_ROUTE_V2 = 0x22
+MSG_ROUTE_ADV = 0x23
 
 MESSAGE_TYPES: dict[str, int] = {
     "hello": MSG_HELLO,
@@ -31,6 +32,7 @@ MESSAGE_TYPES: dict[str, int] = {
     "sync": MSG_SYNC,
     "route_data": MSG_ROUTE_DATA,
     "route_v2": MSG_ROUTE_V2,
+    "route_adv": MSG_ROUTE_ADV,
 }
 
 MESSAGE_TYPE_NAMES = {value: name for name, value in MESSAGE_TYPES.items()}
@@ -43,6 +45,10 @@ ROUTE_V2_E2E_ASSOCIATED_DATA = struct.Struct("!4sBBBBBIBBH")
 ROUTE_V2_E2E_ASSOCIATED_DATA_SIZE = ROUTE_V2_E2E_ASSOCIATED_DATA.size
 SYNC_PAYLOAD = struct.Struct("!QIHI")
 SYNC_PAYLOAD_SIZE = SYNC_PAYLOAD.size
+ROUTE_ADV_PAYLOAD = struct.Struct("!HB")
+ROUTE_ADV_PAYLOAD_SIZE = ROUTE_ADV_PAYLOAD.size
+ROUTE_ADV_UNREACHABLE_COST = 0xFFFF
+ROUTE_ADV_UNREACHABLE_HOPS = 0xFF
 STATUS_VERSION = 1
 STATUS_PAYLOAD = struct.Struct("!BIBBB")
 STATUS_PAYLOAD_SIZE = STATUS_PAYLOAD.size
@@ -208,6 +214,12 @@ class SyncStatus:
     slot: int
     channel: int
     next_hop_ms: int
+
+
+@dataclass(frozen=True)
+class RouteAdvPayload:
+    cost_to_base: int
+    hops_to_base: int
 
 
 @dataclass(frozen=True)
@@ -611,6 +623,22 @@ def decode_sync_payload(payload: bytes) -> SyncStatus:
         channel=channel,
         next_hop_ms=next_hop_ms,
     )
+
+
+def encode_route_adv_payload(*, cost_to_base: int, hops_to_base: int) -> bytes:
+    _require_u16("cost_to_base", cost_to_base)
+    _require_u8("hops_to_base", hops_to_base)
+    return ROUTE_ADV_PAYLOAD.pack(cost_to_base, hops_to_base)
+
+
+def decode_route_adv_payload(payload: bytes) -> RouteAdvPayload:
+    if len(payload) != ROUTE_ADV_PAYLOAD_SIZE:
+        raise AppFrameError(
+            f"route_adv payload length mismatch: expected={ROUTE_ADV_PAYLOAD_SIZE} "
+            f"actual={len(payload)}"
+        )
+    cost_to_base, hops_to_base = ROUTE_ADV_PAYLOAD.unpack(payload)
+    return RouteAdvPayload(cost_to_base=cost_to_base, hops_to_base=hops_to_base)
 
 
 def encode_status_payload(

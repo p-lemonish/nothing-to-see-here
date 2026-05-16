@@ -51,6 +51,8 @@ class NodeRecord:
     mcs_index: int | None = None
     via: int | None = None
     battery: int | None = None
+    cost_to_base: int | None = None
+    hops_to_base: int | None = None
     message: str = ""
     source: str = "config"
 
@@ -488,6 +490,18 @@ class MeshState:
                 }
             )
 
+    def ingest_route_adv(
+        self,
+        *,
+        origin_id: int,
+        cost_to_base: int,
+        hops_to_base: int,
+    ) -> None:
+        with self._lock:
+            node = self._ensure_node_locked(origin_id)
+            node.cost_to_base = cost_to_base
+            node.hops_to_base = hops_to_base
+
     def snapshot(self) -> dict[str, Any]:
         now = time.time()
         with self._lock:
@@ -595,6 +609,8 @@ class MeshState:
             "mcs_index": node.mcs_index,
             "via": node.via,
             "battery": node.battery,
+            "cost_to_base": node.cost_to_base,
+            "hops_to_base": node.hops_to_base,
             "message": node.message,
             "source": node.source,
             "jammed": node.node_id in self.jammed_sim_nodes,
@@ -640,9 +656,12 @@ def _extract_rssi(meta: Any) -> int | None:
 def process_radio_payload(state: MeshState, payload: bytes, meta: Any) -> None:
     from wfb_rs_py.app_proto import (
         AppFrameError,
+        MSG_ROUTE_ADV,
         MSG_ROUTE_DATA,
         MSG_SYNC,
+        ROUTE_ADV_UNREACHABLE_COST,
         decode_frame,
+        decode_route_adv_payload,
         decode_route_data_payload,
         decode_sync_payload,
     )
@@ -656,6 +675,20 @@ def process_radio_payload(state: MeshState, payload: bytes, meta: Any) -> None:
 
         if frame.message_type == MSG_ROUTE_DATA:
             route = decode_route_data_payload(frame.payload)
+
+            if route.inner_type == MSG_ROUTE_ADV:
+                try:
+                    adv = decode_route_adv_payload(route.inner_payload)
+                    if adv.cost_to_base < ROUTE_ADV_UNREACHABLE_COST:
+                        state.ingest_route_adv(
+                            origin_id=route.origin_sender_id,
+                            cost_to_base=adv.cost_to_base,
+                            hops_to_base=adv.hops_to_base,
+                        )
+                except AppFrameError:
+                    pass
+                return
+
             routed_payload = route.inner_payload
             if route.inner_type == MSG_SYNC:
                 sync = decode_sync_payload(route.inner_payload)

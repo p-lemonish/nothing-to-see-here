@@ -164,7 +164,58 @@ frames during debugging.
 - Live tests have validated three nodes using TTL forwarding, deduplication,
   channel hopping, and sync heartbeats.
 - Secure mesh mode still needs a live three-node RF test.
+- Current secure mesh mode is not node-to-C2 end-to-end encryption. It encrypts
+  mesh payload bytes with the shared `mesh_group` key. Routing metadata remains
+  visible on the wire.
 - No ACK/retry/session example is implemented.
+
+## Current Wire Visibility
+
+Current Phase A secure mesh mode protects payload content from listeners who do
+not have the mesh group key, but it does not hide routing metadata.
+
+Plaintext/readable on the wire:
+
+```text
+802.11 synthetic MAC: 57:42:de:ad:be:ef
+outer app header
+route wrapper:
+  origin_sender_id
+  destination_id
+  ttl
+  origin_seq
+  inner_type
+  encrypted_payload_len
+secure wrapper:
+  secure_version
+  security_domain
+  key_id
+  key_epoch
+  nonce
+```
+
+Encrypted:
+
+```text
+actual inner payload bytes
+```
+
+For example, a listener can see that node `2` sent `type=status` with
+`seq=123`, but cannot read the status body without the `mesh_group` key.
+
+This is intentionally different from the planned C2 model:
+
+```text
+Current Phase A:
+  mesh-group encryption
+  trusted mesh nodes can decrypt and re-encrypt mesh payloads
+  useful for routine node-to-node status/data
+
+Planned Phase B:
+  node-to-C2 and C2-to-node end-to-end encryption
+  relays forward opaque encrypted payloads
+  only the endpoint can decrypt C2 payloads
+```
 
 ## Node-To-Node Test
 
@@ -864,6 +915,8 @@ Phase A - secure mesh baseline:
 - implemented: authenticate route metadata in AEAD associated data
 - implemented: config-only crypto controls
 - implemented: team stream id `0xdeadbeef`
+- current limitation: route metadata is plaintext; only the inner payload bytes
+  are encrypted
 - next: live-test secure mesh mode across three nodes
 
 Phase B - opaque C2 traffic:
@@ -872,6 +925,7 @@ Phase B - opaque C2 traffic:
 - add `node_to_c2` and `c2_to_node` key configs
 - let relays forward C2 packets without decrypting
 - only endpoints decrypt
+- preserve only enough outer metadata for relays to route C2 traffic
 
 Phase C - C2 command authority:
 

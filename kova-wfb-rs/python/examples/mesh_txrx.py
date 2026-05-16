@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import configparser
 import json
+import math
 import os
 import secrets
 import socket
@@ -81,6 +83,10 @@ LINK_STATE_ISOLATED = "isolated"
 LINK_STATE_RECOVERY = "recovery"
 LINK_STATE_MOVING = "moving"
 LINK_STATE_RTB = "rtb"
+
+KOVA_IMAGE_MAGIC = b"KOVA"
+PIXEL_FMT_GRAYSCALE = 0
+PIXEL_FMT_RGB = 1
 
 
 @dataclass(frozen=True)
@@ -337,6 +343,62 @@ def _addr_label(address_type: int, address_id: int) -> str:
     return f"{address_type_name(address_type)}:{address_id}"
 
 
+def _hsv_to_rgb(h: float, s: float, v: float) -> tuple[int, int, int]:
+    c = v * s
+    x = c * (1 - abs((h / 60.0) % 2 - 1))
+    m = v - c
+    if h < 60:
+        r1, g1, b1 = c, x, 0
+    elif h < 120:
+        r1, g1, b1 = x, c, 0
+    elif h < 180:
+        r1, g1, b1 = 0, c, x
+    elif h < 240:
+        r1, g1, b1 = 0, x, c
+    elif h < 300:
+        r1, g1, b1 = x, 0, c
+    else:
+        r1, g1, b1 = c, 0, x
+    return (int((r1 + m) * 255), int((g1 + m) * 255), int((b1 + m) * 255))
+
+
+def _build_image_frame(
+    *,
+    width: int,
+    height: int,
+    pixel_format: int,
+    counter: int,
+    style: str,
+) -> bytes:
+    if pixel_format == PIXEL_FMT_GRAYSCALE:
+        pixels = bytearray(width * height)
+        for y in range(height):
+            for x in range(width):
+                if style == "gradient":
+                    hue = (counter * 13 + x * 7 + y * 3) % 360
+                    _, _, v = _hsv_to_rgb(hue, 0.85, 0.5)
+                    pixels[y * width + x] = v
+                else:
+                    pixels[y * width + x] = (counter + x + y) % 256
+        return KOVA_IMAGE_MAGIC + struct.pack("!BBB", width, height, pixel_format) + bytes(pixels)
+
+    pixels = bytearray(width * height * 3)
+    for y in range(height):
+        for x in range(width):
+            if style == "gradient":
+                hue = (counter * 13 + x * 7 + y * 3) % 360
+                r, g, b = _hsv_to_rgb(hue, 0.85, 0.5 + 0.5 * math.cos(x / width * math.pi) * math.sin(y / height * math.pi))
+            else:
+                r = (counter * 7 + x * 3) % 256
+                g = (counter * 11 + y * 5) % 256
+                b = (counter * 17 + (x + y) * 2) % 256
+            offset = (y * width + x) * 3
+            pixels[offset] = r
+            pixels[offset + 1] = g
+            pixels[offset + 2] = b
+    return KOVA_IMAGE_MAGIC + struct.pack("!BBB", width, height, pixel_format) + bytes(pixels)
+
+
 def _normalize_ingest_url(value: str | None) -> str | None:
     if value is None:
         return None
@@ -552,6 +614,14 @@ def _load_config(path: str | None) -> dict[str, object]:
         for key in ("interval_ms", "destination_id", "ttl", "start_counter"):
             if key in section:
                 out[f"c2_uplink_{key}"] = int(section[key], 0)
+        for key in ("image_width", "image_height"):
+            if key in section:
+                out[f"c2_uplink_{key}"] = int(section[key], 0)
+        for key in ("image_format", "image_style"):
+            if key in section:
+                value = _optional_text(section.get(key))
+                if value is not None:
+                    out[f"c2_uplink_{key}"] = value
 
     if parser.has_section(MESH_CRYPTO_SECTION):
         section = parser[MESH_CRYPTO_SECTION]
@@ -940,11 +1010,24 @@ def main() -> int:
         default=config_defaults.get("c2_uplink_interval_ms", 1000),
     )
     parser.add_argument(
-        "--c2-uplink-message-template",
-        default=config_defaults.get(
-            "c2_uplink_message_template",
-            "node {sender_id} c2 test {counter}",
-        ),
+        "--c2-uplink-image-width",
+        type=int,
+        default=config_defaults.get("c2_uplink_image_width", 32),
+    )
+    parser.add_argument(
+        "--c2-uplink-image-height",
+        type=int,
+        default=config_defaults.get("c2_uplink_image_height", 32),
+    )
+    parser.add_argument(
+        "--c2-uplink-image-format",
+        default=config_defaults.get("c2_uplink_image_format", "rgb"),
+        help="pixel format: rgb or grayscale",
+    )
+    parser.add_argument(
+        "--c2-uplink-image-style",
+        default=config_defaults.get("c2_uplink_image_style", "gradient"),
+        help="visual style: gradient or random",
     )
     parser.add_argument(
         "--c2-uplink-message-type",
@@ -1084,6 +1167,12 @@ def main() -> int:
             parser.error("--c2-uplink-ttl must be in range 0..255")
         if args.c2_uplink_start_counter < 0:
             parser.error("--c2-uplink-start-counter must be >= 0")
+    if args.c2_uplink_image_width < 1 or args.c2_uplink_image_height < 1:
+        parser.error("--c2-uplink-image-width/height must be > 0")
+    if args.c2_uplink_image_format not in {"rgb", "grayscale"}:
+        parser.error("--c2-uplink-image-format must be rgb or grayscale")
+    if args.c2_uplink_image_style not in {"gradient", "random"}:
+        parser.error("--c2-uplink-image-style must be gradient or random")
 
     try:
         inner_type = message_type_value(args.message_type)
@@ -1449,16 +1538,17 @@ def main() -> int:
         return static_inner_payload
 
     def build_c2_uplink_payload(counter: int) -> bytes:
-        text = args.c2_uplink_message_template.format(
+        pixel_format = PIXEL_FMT_RGB if args.c2_uplink_image_format == "rgb" else PIXEL_FMT_GRAYSCALE
+        frame = _build_image_frame(
+            width=args.c2_uplink_image_width,
+            height=args.c2_uplink_image_height,
+            pixel_format=pixel_format,
             counter=counter,
-            sender_id=args.sender_id,
-            node_id=args.sender_id,
-            utc_ms=_utc_ms(),
+            style=args.c2_uplink_image_style,
         )
-        payload = text.encode("utf-8")
-        if len(payload) > MAX_U16:
-            raise ValueError(f"c2 uplink payload too large: {len(payload)}")
-        return payload
+        if len(frame) > MAX_U16:
+            raise ValueError(f"c2 uplink image payload too large: {len(frame)}")
+        return frame
 
     def close_radio() -> None:
         nonlocal tx, rx

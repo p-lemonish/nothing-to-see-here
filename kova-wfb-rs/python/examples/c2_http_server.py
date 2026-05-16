@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import configparser
 import html
 import json
@@ -34,6 +35,7 @@ from wfb_rs_py.app_proto import (
 )
 
 MAX_EVENTS = 1000
+KOVA_IMAGE_MAGIC = b"KOVA"
 
 
 @dataclass(frozen=True)
@@ -118,7 +120,8 @@ class C2EventStore:
             secure.key_epoch,
         )
 
-        event = {
+        is_image = plaintext[:4] == KOVA_IMAGE_MAGIC
+        event: dict[str, Any] = {
             "received_at_ms": _utc_ms(),
             "client_ip": client_ip,
             "gateway_id": upload.get("gateway_id"),
@@ -136,9 +139,23 @@ class C2EventStore:
             "key_epoch": secure.key_epoch,
             "key_label": key.label,
             "payload_len": len(plaintext),
-            "payload_text": plaintext.decode("utf-8", errors="replace"),
             "duplicate": False,
         }
+
+        if is_image:
+            width = plaintext[4]
+            height = plaintext[5]
+            pixel_format = plaintext[6]
+            pixel_data = plaintext[7:]
+            event["is_image"] = True
+            event["image_width"] = width
+            event["image_height"] = height
+            event["image_pixel_format"] = "rgb" if pixel_format == 1 else "grayscale"
+            event["image_data_b64"] = base64.b64encode(pixel_data).decode("ascii")
+            event["payload_text"] = f"[image {width}x{height}]"
+        else:
+            event["is_image"] = False
+            event["payload_text"] = plaintext.decode("utf-8", errors="replace")
 
         with self._lock:
             if dedupe_key in self._seen:
@@ -295,7 +312,37 @@ def render_html(latest_events: list[dict[str, Any]]) -> bytes:
         "code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}",
         ".payload{max-width:52rem;white-space:pre-wrap;word-break:break-word}",
         ".empty{color:#666}",
+        "canvas.image-preview{image-rendering:pixelated;width:192px;height:192px;border:1px solid #ccc}",
         "</style>",
+        '<script>',
+        'function drawImage(canvasId, b64, w, h, fmt) {',
+        '  var canvas = document.getElementById(canvasId);',
+        '  if (!canvas) return;',
+        '  var ctx = canvas.getContext("2d");',
+        '  var raw = atob(b64);',
+        '  var bytes = new Uint8Array(raw.length);',
+        '  for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);',
+        '  var imgData = ctx.createImageData(w, h);',
+        '  var channels = fmt === "rgb" ? 3 : 1;',
+        '  for (var y = 0; y < h; y++) {',
+        '    for (var x = 0; x < w; x++) {',
+        '      var srcOff = (y * w + x) * channels;',
+        '      var dstOff = (y * w + x) * 4;',
+        '      if (channels === 3) {',
+        '        imgData.data[dstOff] = bytes[srcOff];',
+        '        imgData.data[dstOff + 1] = bytes[srcOff + 1];',
+        '        imgData.data[dstOff + 2] = bytes[srcOff + 2];',
+        '      } else {',
+        '        imgData.data[dstOff] = bytes[srcOff];',
+        '        imgData.data[dstOff + 1] = bytes[srcOff];',
+        '        imgData.data[dstOff + 2] = bytes[srcOff];',
+        '      }',
+        '      imgData.data[dstOff + 3] = 255;',
+        '    }',
+        '  }',
+        '  ctx.putImageData(imgData, 0, 0);',
+        '}',
+        '</script>',
         "</head>",
         "<body>",
         "<h1>Kova C2 Payloads</h1>",
@@ -309,17 +356,35 @@ def render_html(latest_events: list[dict[str, Any]]) -> bytes:
             "<th>Gateway</th><th>Key</th><th>Payload</th></tr>"
         )
         for event in latest_events:
-            parts.append(
-                "<tr>"
-                f"<td>{event['origin_id']}</td>"
-                f"<td>{event['received_at_ms']}</td>"
-                f"<td>{event['origin_seq']}</td>"
-                f"<td>{html.escape(str(event['inner_type']))}</td>"
-                f"<td>{html.escape(str(event.get('gateway_id')))}</td>"
-                f"<td>{event['key_id']}:{event['key_epoch']}</td>"
-                f"<td class=\"payload\"><code>{html.escape(str(event['payload_text']))}</code></td>"
-                "</tr>"
-            )
+            if event.get("is_image"):
+                canvas_id = f"img_{event['origin_id']}_{event['origin_seq']}"
+                parts.append(
+                    "<tr>"
+                    f"<td>{event['origin_id']}</td>"
+                    f"<td>{event['received_at_ms']}</td>"
+                    f"<td>{event['origin_seq']}</td>"
+                    f"<td>{html.escape(str(event['inner_type']))}</td>"
+                    f"<td>{html.escape(str(event.get('gateway_id')))}</td>"
+                    f"<td>{event['key_id']}:{event['key_epoch']}</td>"
+                    f"<td class=\"payload\"><canvas id=\"{canvas_id}\" class=\"image-preview\" "
+                    f"width=\"{event['image_width']}\" height=\"{event['image_height']}\"></canvas>"
+                    f"<script>drawImage('{canvas_id}', '{event['image_data_b64']}', "
+                    f"{event['image_width']}, {event['image_height']}, "
+                    f"'{event['image_pixel_format']}')</script></td>"
+                    "</tr>"
+                )
+            else:
+                parts.append(
+                    "<tr>"
+                    f"<td>{event['origin_id']}</td>"
+                    f"<td>{event['received_at_ms']}</td>"
+                    f"<td>{event['origin_seq']}</td>"
+                    f"<td>{html.escape(str(event['inner_type']))}</td>"
+                    f"<td>{html.escape(str(event.get('gateway_id')))}</td>"
+                    f"<td>{event['key_id']}:{event['key_epoch']}</td>"
+                    f"<td class=\"payload\"><code>{html.escape(str(event['payload_text']))}</code></td>"
+                    "</tr>"
+                )
         parts.append("</table>")
     parts.extend(["</body>", "</html>"])
     return "\n".join(parts).encode("utf-8")

@@ -29,3 +29,6 @@ python/.venv/
 
 examples_c/*
 !examples_c/*.*
+
+# uv
+uv.lock

@@ -1,0 +1,18 @@
+# Node 1 — reconnaissance drone
+# One line = one transmitted story fragment. Comments and blank lines are ignored.
+
+Area scan initiated. Grid sector alpha-7. Altitude 120m. Weather nominal.
+Photo burst captured. Coordinates 47.3361N, 8.4481E. 3 objects of interest flagged.
+Thermal sweep negative. No heat signatures in primary scan corridor.
+Visual lock on target bearing 042. Range 2.1 km. Optical tracking active.
+Optical resolution 4K active. Licence plate recognition: 2 vehicles logged.
+Battery 78%. Estimated flight time remaining: 22 minutes.
+Area survey 40% complete. Northeast quadrant clear.
+Wind 14 kts NNW. Camera gimbal compensating. Image quality nominal.
+Signal sweep complete. No hostile RF emissions detected in monitored band.
+Photo burst #2 complete. 47 new images captured and queued for mesh upload.
+Terrain elevation change ahead. Adjusting altitude from 120m to 135m.
+Object of interest reclassified as non-threat. Agricultural vehicle confirmed.
+Returning to primary patrol corridor. Waypoint delta in 340m.
+Sensor array nominal. IR, optical, and acoustic all reporting green.
+New area of interest detected at grid C4. Redirecting for closer inspection.

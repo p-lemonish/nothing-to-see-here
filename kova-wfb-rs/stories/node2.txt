@@ -1,0 +1,15 @@
+# Node 2 — relay drone
+# One line = one transmitted story fragment. Comments and blank lines are ignored.
+
+Mesh relay active. Position 47.2918N, 8.4052E. Altitude 80m.
+Bridging nodes 1 and 3. Uplink SNR 24 dB. Downlink SNR 21 dB. Both nominal.
+Packet relay rate 98.7%. Zero drops in last 60 seconds.
+Signal bridge extending mesh coverage by 1.4 km northward.
+Position hold engaged. Drift correction applied: 0.3 m south.
+Battery 85%. Hovering at relay waypoint. Wind compensation active.
+Forwarding 23 packets/sec. Buffer utilization 12%. Link stable.
+Adjusting altitude to 95m for improved line-of-sight geometry.
+Mesh topology: 3 nodes active and synchronized. Average latency 42 ms.
+Rebroadcasting telemetry from node 1. Fragment batch delivered to node 3.
+Cross-link quality between nodes 1 and 3: excellent.
+Power nominal. Solar supplementing battery at 8 W.

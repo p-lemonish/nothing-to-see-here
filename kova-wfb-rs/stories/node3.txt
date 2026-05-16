@@ -1,0 +1,16 @@
+# Node 3 — tactical drone
+# One line = one transmitted story fragment. Comments and blank lines are ignored.
+
+Approaching objective corridor. Distance 840m. Approach vector clear.
+Laser designator on standby. Target illuminated at bearing 118.
+Engagement window conditions met. Awaiting command authorisation.
+Proximity sensors nominal. No obstacles detected in flight path.
+Target lock confirmed. Tracking stable. Holding at current range.
+Payload bay status nominal. Safety protocol engaged per mission rules.
+Ingress route alpha confirmed clear. ETA to objective: 47 seconds.
+Thermal scope: structure occupied. Estimated 2 personnel present.
+Abort criteria not triggered. Continuing mission profile.
+Egress route bravo surveyed clear. Post-mission holding pattern ready.
+Data link quality to node 2: excellent. Full telemetry streaming.
+Mission phase 2 complete. Transitioning to surveillance hold at altitude 90m.
+Wide-angle camera selected. 180-degree sweep of objective area in progress.

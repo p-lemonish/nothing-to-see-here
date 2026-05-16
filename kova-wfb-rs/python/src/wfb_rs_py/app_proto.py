@@ -16,6 +16,8 @@ MSG_TEXT = 0x02
 MSG_DATA = 0x03
 MSG_STATUS = 0x04
 MSG_SYNC = 0x05
+MSG_STORY = 0x06
+MSG_STORY_STATE = 0x07
 MSG_ROUTE_DATA = 0x21
 
 MESSAGE_TYPES: dict[str, int] = {
@@ -24,6 +26,8 @@ MESSAGE_TYPES: dict[str, int] = {
     "data": MSG_DATA,
     "status": MSG_STATUS,
     "sync": MSG_SYNC,
+    "story": MSG_STORY,
+    "story_state": MSG_STORY_STATE,
     "route_data": MSG_ROUTE_DATA,
 }
 

@@ -35,6 +35,7 @@ from wfb_rs_py.app_proto import (
 
 MAX_U16 = 0xFFFF
 MAX_U32 = 0xFFFF_FFFF
+DEFAULT_STREAM_ID = 0xDEAD_BEEF
 CONFIG_SECTION = "mesh"
 MESH_CRYPTO_SECTION = "mesh_crypto"
 SECURE_ROUTE_AAD = struct.Struct("!4sBBBIBH")
@@ -359,7 +360,7 @@ def main() -> int:
     parser.add_argument(
         "--stream-id",
         type=lambda value: int(value, 0),
-        default=config_defaults.get("stream_id", 1),
+        default=config_defaults.get("stream_id", DEFAULT_STREAM_ID),
     )
     parser.add_argument(
         "--sender-id",
@@ -482,8 +483,8 @@ def main() -> int:
 
     if not args.iface:
         parser.error("--iface is required unless NIC, WFB_IFACE, or IFACE is set")
-    if args.stream_id == 0:
-        parser.error("--stream-id must be non-zero")
+    if not 1 <= args.stream_id <= MAX_U32:
+        parser.error("--stream-id must be in range 1..0xffffffff")
     if args.sender_id is None:
         parser.error("--sender-id is required unless WFB_SENDER_ID or SENDER_ID is set")
     if not 1 <= args.sender_id <= 255:

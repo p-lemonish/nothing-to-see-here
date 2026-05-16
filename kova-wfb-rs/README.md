@@ -15,6 +15,8 @@ Two different "channel" concepts, do not confuse:
 - **`stream_id`** — a 32-bit logical demux tag baked into the synthetic 802.11 addr2/addr3 MACs as `57:42:<stream_id big-endian>`. Lets multiple independent wfb streams share the same RF channel; RX drops frames whose embedded `stream_id` does not match.
 
 Two peers must agree on **both** the wifi channel and the `stream_id` to exchange traffic.
+The current team stream id is `0xdeadbeef`, which appears in packet captures as
+`57:42:de:ad:be:ef`.
 
 ## Runtime prerequisites
 
@@ -84,7 +86,7 @@ Both TX and RX on a single interface. Frames it injects itself are filtered out 
 
 On each peer:
 ```bash
-sudo ./target/debug/examples/simple_txrx --iface "$NIC" --stream-id 1
+sudo ./target/debug/examples/simple_txrx --iface "$NIC" --stream-id 0xdeadbeef
 ```
 
 Then type a line on peer A's stdin — it appears as `RX seq=… payload="…"` on peer B.
@@ -102,13 +104,13 @@ Separate `--role tx` and `--role rx` processes on two peers. The TX side generat
 Receiver:
 
 ```bash
-sudo ./target/debug/examples/bandwidth --role rx --iface "$NIC" --stream-id 1
+sudo ./target/debug/examples/bandwidth --role rx --iface "$NIC" --stream-id 0xdeadbeef
 ```
 
 Sender:
 
 ```bash
-sudo ./target/debug/examples/bandwidth --role tx --iface "$NIC" --stream-id 1
+sudo ./target/debug/examples/bandwidth --role tx --iface "$NIC" --stream-id 0xdeadbeef
 ```
 
 Useful knobs:
@@ -119,10 +121,17 @@ Useful knobs:
 
 ## Sniffing wfb_rs traffic with tcpdump
 
-wfb_rs-injected frames carry a fixed addr2/addr3 of `57:42:<stream_id big-endian>`. For `--stream-id 1` that's `57:42:00:00:00:01`:
+wfb_rs-injected frames carry a fixed addr2/addr3 of `57:42:<stream_id big-endian>`. For `--stream-id 0xdeadbeef` that is `57:42:de:ad:be:ef`:
 
 ```bash
-sudo tcpdump -i "$NIC" -y IEEE802_11_RADIO -nn -e -vvv 'wlan addr2 57:42:00:00:00:01'
+sudo tcpdump -i "$NIC" -y IEEE802_11_RADIO -nn -e -vvv 'wlan addr2 57:42:de:ad:be:ef'
+```
+
+Useful Wireshark filters:
+
+```text
+wlan.addr == 57:42:de:ad:be:ef
+wlan.addr contains 57:42:de:ad:be:ef
 ```
 
 To see all wfb_rs traffic regardless of `stream_id`, drop the filter and grep visually for addr2 starting `57:42:` — tcpdump's BPF for `wlan[N:M]` indexing on radiotap captures is not reliable across versions.
@@ -190,10 +199,10 @@ Usage:
 ```python
 from wfb_rs_py import Tx, Rx
 
-with Tx(iface="wlan0", stream_id=1) as tx:
+with Tx(iface="wlan0", stream_id=0xdeadbeef) as tx:
     tx.send(b"hello", seq=1)
 
-with Rx(iface="wlan0", stream_id=1) as rx:
+with Rx(iface="wlan0", stream_id=0xdeadbeef) as rx:
     maybe_frame = rx.recv_optional(timeout_ms=100)
     if maybe_frame is not None:
         payload, meta = maybe_frame
@@ -204,7 +213,7 @@ Runnable example:
 
 ```bash
 cd python
-sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py --stream-id 1
+sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py --stream-id 0xdeadbeef
 ```
 
 If `NIC`, `WFB_IFACE`, or `IFACE` is set, the Python example uses it as the
@@ -213,7 +222,7 @@ Wireshark/tcpdump:
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py \
-  --message "hello world" --include-self --stream-id 1
+  --message "hello world" --include-self --stream-id 0xdeadbeef
 ```
 
 To keep broadcasting while other peers come online on the same wifi channel and
@@ -221,7 +230,7 @@ To keep broadcasting while other peers come online on the same wifi channel and
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py \
-  --message "hello world" --count 0 --tx-interval-ms 1000 --stream-id 1
+  --message "hello world" --count 0 --tx-interval-ms 1000 --stream-id 0xdeadbeef
 ```
 
 The Python example also has an optional v0 app protocol header for compact
@@ -232,7 +241,7 @@ Peer A:
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py \
-  --iface "$NIC" --stream-id 1 --app-proto --sender-id 1 \
+  --iface "$NIC" --stream-id 0xdeadbeef --app-proto --sender-id 1 \
   --message "hello from node 1" --message-type hello --count 0 --tx-interval-ms 1000
 ```
 
@@ -240,7 +249,7 @@ Peer B:
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py \
-  --iface "$NIC" --stream-id 1 --app-proto --sender-id 2 \
+  --iface "$NIC" --stream-id 0xdeadbeef --app-proto --sender-id 2 \
   --message "hello from node 2" --message-type hello --count 0 --tx-interval-ms 1000
 ```
 
@@ -249,14 +258,14 @@ or receiver node with a unique sender id:
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/mesh_txrx.py \
-  --iface "$NIC" --stream-id 1 --sender-id 67
+  --iface "$NIC" --stream-id 0xdeadbeef --sender-id 67
 ```
 
 To originate a broadcast routed message:
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/mesh_txrx.py \
-  --iface "$NIC" --stream-id 1 --sender-id 42 \
+  --iface "$NIC" --stream-id 0xdeadbeef --sender-id 42 \
   --message "battery=91" --message-type status --destination-id 0 \
   --ttl 2 --count 0 --tx-interval-ms 1000
 ```

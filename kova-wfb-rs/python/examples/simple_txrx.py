@@ -18,6 +18,9 @@ from wfb_rs_py.app_proto import (
     message_type_value,
 )
 
+DEFAULT_STREAM_ID = 0xDEAD_BEEF
+MAX_U32 = 0xFFFF_FFFF
+
 
 def run_simple_txrx(
     iface: str,
@@ -166,9 +169,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--stream-id",
-        type=int,
-        default=1,
-        help="stream id (u32, default: 1)",
+        type=lambda value: int(value, 0),
+        default=DEFAULT_STREAM_ID,
+        help="stream id (u32, decimal or hex, default: 0xdeadbeef)",
     )
     parser.add_argument(
         "--timeout-ms",
@@ -228,8 +231,8 @@ def main() -> int:
 
     if not args.iface:
         parser.error("--iface is required unless NIC, WFB_IFACE, or IFACE is set")
-    if args.stream_id == 0:
-        parser.error("--stream-id must be non-zero")
+    if not 1 <= args.stream_id <= MAX_U32:
+        parser.error("--stream-id must be in range 1..0xffffffff")
     if args.count < 0:
         parser.error("--count must be >= 0")
     if args.app_proto:

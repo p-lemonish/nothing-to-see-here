@@ -27,13 +27,16 @@ pip install -e .
 
 ## Usage
 
+The current team stream id is `0xdeadbeef`, which appears in Wireshark/tcpdump
+as `57:42:de:ad:be:ef`.
+
 ```python
 from wfb_rs_py import Tx, Rx
 
-with Tx(iface="wlan0", stream_id=1) as tx:
+with Tx(iface="wlan0", stream_id=0xdeadbeef) as tx:
     tx.send(b"hello", seq=1)
 
-with Rx(iface="wlan0", stream_id=1) as rx:
+with Rx(iface="wlan0", stream_id=0xdeadbeef) as rx:
     result = rx.recv_optional(timeout_ms=100)
     if result is not None:
         payload, meta = result
@@ -43,7 +46,7 @@ with Rx(iface="wlan0", stream_id=1) as rx:
 Runnable example script:
 
 ```bash
-sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py --iface "$NIC" --stream-id 1
+sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py --iface "$NIC" --stream-id 0xdeadbeef
 ```
 
 If `NIC`, `WFB_IFACE`, or `IFACE` is set, `--iface` can be omitted. For a
@@ -51,7 +54,7 @@ single-adapter smoke test that should also show up in Wireshark/tcpdump:
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py \
-  --message "hello world" --include-self --stream-id 1
+  --message "hello world" --include-self --stream-id 0xdeadbeef
 ```
 
 For a repeated broadcast while bringing up peers on the same wifi channel and
@@ -59,7 +62,7 @@ For a repeated broadcast while bringing up peers on the same wifi channel and
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py \
-  --message "hello world" --count 0 --tx-interval-ms 1000 --stream-id 1
+  --message "hello world" --count 0 --tx-interval-ms 1000 --stream-id 0xdeadbeef
 ```
 
 To include the v0 app header with a compact sender id, use app protocol mode.
@@ -70,7 +73,7 @@ Peer A:
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py \
-  --iface "$NIC" --stream-id 1 --app-proto --sender-id 1 \
+  --iface "$NIC" --stream-id 0xdeadbeef --app-proto --sender-id 1 \
   --message "hello from node 1" --message-type hello --count 0 --tx-interval-ms 1000
 ```
 
@@ -78,7 +81,7 @@ Peer B:
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/simple_txrx.py \
-  --iface "$NIC" --stream-id 1 --app-proto --sender-id 2 \
+  --iface "$NIC" --stream-id 0xdeadbeef --app-proto --sender-id 2 \
   --message "hello from node 2" --message-type hello --count 0 --tx-interval-ms 1000
 ```
 
@@ -87,14 +90,14 @@ or receiver node with a unique sender id:
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/mesh_txrx.py \
-  --iface "$NIC" --stream-id 1 --sender-id 67
+  --iface "$NIC" --stream-id 0xdeadbeef --sender-id 67
 ```
 
 To originate a broadcast routed message:
 
 ```bash
 sudo -E "$VIRTUAL_ENV/bin/python" examples/mesh_txrx.py \
-  --iface "$NIC" --stream-id 1 --sender-id 42 \
+  --iface "$NIC" --stream-id 0xdeadbeef --sender-id 42 \
   --message "battery=91" --message-type status --destination-id 0 \
   --ttl 2 --count 0 --tx-interval-ms 1000
 ```

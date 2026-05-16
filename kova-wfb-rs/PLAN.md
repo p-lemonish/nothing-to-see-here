@@ -16,6 +16,9 @@ prototype:
 - sync heartbeats showing `slot_delta=0` and `channel_match=1`
 - UDP-like packet loss behavior; no retransmission dependency
 
+Current team `stream_id` is `0xdeadbeef`, which produces synthetic addr2/addr3
+`57:42:de:ad:be:ef` in Wireshark/tcpdump.
+
 Observed live test results:
 
 - two-node and three-node tests deliver status messages across the mesh
@@ -160,7 +163,7 @@ Peer A:
 ```bash
 export NIC=wlx5cffffaba18f
 sudo python/.venv/bin/python python/examples/simple_txrx.py \
-  --iface "$NIC" --stream-id 1 --app-proto --sender-id 67 \
+  --iface "$NIC" --stream-id 0xdeadbeef --app-proto --sender-id 67 \
   --message "hello 42" --message-type hello --count 0 --tx-interval-ms 1000
 ```
 
@@ -169,7 +172,7 @@ Peer B:
 ```bash
 export NIC=wlxfc221c2004ce
 sudo python/.venv/bin/python python/examples/simple_txrx.py \
-  --iface "$NIC" --stream-id 1 --app-proto --sender-id 42 \
+  --iface "$NIC" --stream-id 0xdeadbeef --app-proto --sender-id 42 \
   --message "hello 67" --message-type hello --count 0 --tx-interval-ms 1000
 ```
 

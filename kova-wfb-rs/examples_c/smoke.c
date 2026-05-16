@@ -13,7 +13,7 @@ int main(void) {
     wfb_tx_handle *tx = NULL;
     wfb_tx_config tx_cfg = {
         .iface = "wlan0",
-        .stream_id = 1,
+        .stream_id = 0xdeadbeef,
         .frame_type = 0x08,
         .mcs_index = 1,
         .bandwidth = 20,

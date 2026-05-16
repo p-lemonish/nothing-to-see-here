@@ -26,6 +26,7 @@ from wfb_rs_py.app_proto import (
     CHACHA20_POLY1305_KEY_SIZE,
     MSG_ROUTE_DATA,
     MSG_ROUTE_V2,
+    MSG_STATUS,
     MSG_SYNC,
     SEC_DOMAIN_C2_TO_NODE,
     SEC_DOMAIN_MESH_GROUP,
@@ -39,6 +40,7 @@ from wfb_rs_py.app_proto import (
     decode_route_data_payload,
     decode_route_v2_payload,
     decode_secure_payload,
+    decode_status_payload,
     decode_sync_payload,
     decrypt_secure_payload,
     encode_frame,
@@ -46,12 +48,16 @@ from wfb_rs_py.app_proto import (
     encode_route_v2_e2e_associated_data,
     encode_route_v2_payload,
     encode_secure_payload,
+    encode_status_payload,
     encode_sync_payload,
     message_type_value,
     security_domain_name,
     security_domain_value,
     traffic_class_name,
     traffic_class_value,
+    STATUS_FLAG_CRYPTO_ENABLED,
+    STATUS_FLAG_DEGRADED_LINK,
+    STATUS_FLAG_FORWARDING_ENABLED,
 )
 
 MAX_U16 = 0xFFFF
@@ -63,6 +69,12 @@ C2_UPLINK_CRYPTO_SECTION = "c2_uplink_crypto"
 C2_DOWNLINK_CRYPTO_SECTION = "c2_downlink_crypto"
 SECURE_ROUTE_AAD = struct.Struct("!4sBBBIBH")
 DEFAULT_C2_ID = 1
+LINK_STATE_NOMINAL = "nominal"
+LINK_STATE_DEGRADED = "degraded"
+LINK_STATE_ISOLATED = "isolated"
+LINK_STATE_RECOVERY = "recovery"
+LINK_STATE_MOVING = "moving"
+LINK_STATE_RTB = "rtb"
 
 
 @dataclass(frozen=True)
@@ -88,6 +100,129 @@ class E2ECryptoConfig:
     key_id: int
     key_epoch: int
     key: bytes
+
+
+@dataclass(frozen=True)
+class LinkHealthTransition:
+    previous_state: str
+    state: str
+    reason: str
+    inactive_ms: int
+    active_peers: int
+
+
+class LinkHealthTracker:
+    def __init__(
+        self,
+        *,
+        sender_id: int,
+        peer_timeout_ms: int,
+        degraded_after_ms: int,
+        isolated_after_ms: int,
+        move_after_ms: int,
+        rtb_after_ms: int,
+        recovery_hold_ms: int,
+    ):
+        self._sender_id = sender_id
+        self._peer_timeout_s = peer_timeout_ms / 1000.0
+        self._degraded_after_ms = degraded_after_ms
+        self._isolated_after_ms = isolated_after_ms
+        self._move_after_ms = move_after_ms
+        self._rtb_after_ms = rtb_after_ms
+        self._recovery_hold_s = recovery_hold_ms / 1000.0
+
+        now = time.monotonic()
+        self._state = LINK_STATE_NOMINAL
+        self._last_link_seen_at = now
+        self._recovery_started_at: float | None = None
+        self._peers_last_seen: dict[int, float] = {}
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    def _prune_stale_peers(self, now: float) -> None:
+        stale_cutoff = now - self._peer_timeout_s
+        stale_peers = [
+            peer_id
+            for peer_id, last_seen_at in self._peers_last_seen.items()
+            if last_seen_at < stale_cutoff
+        ]
+        for peer_id in stale_peers:
+            del self._peers_last_seen[peer_id]
+
+    def active_peer_count(self, now: float) -> int:
+        self._prune_stale_peers(now)
+        return len(self._peers_last_seen)
+
+    def note_peer(self, peer_id: int, now: float) -> None:
+        if peer_id == self._sender_id:
+            return
+        self._peers_last_seen[peer_id] = now
+        self._last_link_seen_at = now
+        self._prune_stale_peers(now)
+
+    def evaluate(self, now: float) -> LinkHealthTransition | None:
+        active_peers = self.active_peer_count(now)
+        inactive_ms = max(0, int((now - self._last_link_seen_at) * 1000))
+        next_state = self._state
+        reason = "stable"
+
+        if active_peers > 0:
+            if self._state in {
+                LINK_STATE_DEGRADED,
+                LINK_STATE_ISOLATED,
+                LINK_STATE_MOVING,
+                LINK_STATE_RTB,
+            }:
+                if self._recovery_started_at is None:
+                    self._recovery_started_at = now
+                next_state = LINK_STATE_RECOVERY
+                reason = "link_reestablished"
+            elif self._state == LINK_STATE_RECOVERY:
+                if self._recovery_started_at is None:
+                    self._recovery_started_at = now
+                if (now - self._recovery_started_at) >= self._recovery_hold_s:
+                    self._recovery_started_at = None
+                    next_state = LINK_STATE_NOMINAL
+                    reason = "links_recovered"
+                else:
+                    next_state = LINK_STATE_RECOVERY
+                    reason = "links_recovering"
+            else:
+                self._recovery_started_at = None
+                next_state = LINK_STATE_NOMINAL
+                reason = "links_healthy"
+        else:
+            self._recovery_started_at = None
+            if inactive_ms >= self._rtb_after_ms:
+                next_state = LINK_STATE_RTB
+                reason = "no_link_after_threshold"
+            elif inactive_ms >= self._move_after_ms:
+                next_state = LINK_STATE_MOVING
+                reason = "no_link_reposition"
+            elif inactive_ms >= self._isolated_after_ms:
+                next_state = LINK_STATE_ISOLATED
+                reason = "all_routes_exhausted"
+            elif inactive_ms >= self._degraded_after_ms:
+                next_state = LINK_STATE_DEGRADED
+                reason = "link_degrading"
+            else:
+                next_state = LINK_STATE_NOMINAL
+                reason = "recent_link"
+
+        if next_state == self._state:
+            return None
+
+        previous_state = self._state
+        self._state = next_state
+        return LinkHealthTransition(
+            previous_state=previous_state,
+            state=next_state,
+            reason=reason,
+            inactive_ms=inactive_ms,
+            active_peers=active_peers,
+        )
 
 
 def _default_iface() -> str | None:
@@ -317,6 +452,7 @@ def _load_config(path: str | None) -> dict[str, object]:
         "c2_http_forward_url",
         "message_type",
         "message",
+        "message_file",
         "hop_channels",
         "channel_width",
     ):
@@ -340,6 +476,12 @@ def _load_config(path: str | None) -> dict[str, object]:
         "channel_settle_ms",
         "channel_tx_guard_ms",
         "sync_interval_ms",
+        "peer_timeout_ms",
+        "link_degraded_after_ms",
+        "link_isolated_after_ms",
+        "link_move_after_ms",
+        "link_rtb_after_ms",
+        "link_recovery_hold_ms",
     ):
         if key in section:
             out[key] = int(section[key], 0)
@@ -350,6 +492,8 @@ def _load_config(path: str | None) -> dict[str, object]:
         "channel_agility",
         "channel_down_up",
         "sync_heartbeat",
+        "message_file_reload",
+        "status_auto",
     ):
         if key in section:
             out[key] = section.getboolean(key)
@@ -552,6 +696,17 @@ def main() -> int:
         help="optional message to originate",
     )
     parser.add_argument(
+        "--message-file",
+        default=config_defaults.get("message_file"),
+        help="optional binary payload file to originate (for data/image demo payloads)",
+    )
+    parser.add_argument(
+        "--message-file-reload",
+        action=argparse.BooleanOptionalAction,
+        default=config_defaults.get("message_file_reload", False),
+        help="reload --message-file before each send (useful for changing snapshots)",
+    )
+    parser.add_argument(
         "--count",
         type=int,
         default=config_defaults.get("count", 0),
@@ -641,6 +796,48 @@ def main() -> int:
         default=config_defaults.get("sync_interval_ms", 5000),
         help="interval between sync heartbeat packets",
     )
+    parser.add_argument(
+        "--status-auto",
+        action=argparse.BooleanOptionalAction,
+        default=config_defaults.get("status_auto", True),
+        help="auto-generate binary status payloads when --message-type=status and no payload is set",
+    )
+    parser.add_argument(
+        "--peer-timeout-ms",
+        type=int,
+        default=config_defaults.get("peer_timeout_ms", 12000),
+        help="peer is treated stale after this many ms without any routed packet",
+    )
+    parser.add_argument(
+        "--link-degraded-after-ms",
+        type=int,
+        default=config_defaults.get("link_degraded_after_ms", 5000),
+        help="enter DEGRADED after this many ms without active peers",
+    )
+    parser.add_argument(
+        "--link-isolated-after-ms",
+        type=int,
+        default=config_defaults.get("link_isolated_after_ms", 15000),
+        help="enter ISOLATED after this many ms without active peers",
+    )
+    parser.add_argument(
+        "--link-move-after-ms",
+        type=int,
+        default=config_defaults.get("link_move_after_ms", 30000),
+        help="enter MOVING after this many ms without active peers",
+    )
+    parser.add_argument(
+        "--link-rtb-after-ms",
+        type=int,
+        default=config_defaults.get("link_rtb_after_ms", 60000),
+        help="enter RTB after this many ms without active peers",
+    )
+    parser.add_argument(
+        "--link-recovery-hold-ms",
+        type=int,
+        default=config_defaults.get("link_recovery_hold_ms", 5000),
+        help="time spent in RECOVERY before returning to NOMINAL",
+    )
     args = parser.parse_args()
 
     if not args.iface:
@@ -708,6 +905,10 @@ def main() -> int:
         parser.error("--count must be >= 0")
     if args.tx_interval_ms < 0:
         parser.error("--tx-interval-ms must be >= 0")
+    if args.message is not None and args.message_file is not None:
+        parser.error("--message and --message-file are mutually exclusive")
+    if args.message_file_reload and not args.message_file:
+        parser.error("--message-file-reload requires --message-file")
     if args.rx_timeout_ms <= 0:
         parser.error("--rx-timeout-ms must be > 0")
     if args.seen_limit < 1:
@@ -726,6 +927,18 @@ def main() -> int:
         parser.error("--channel-tx-guard-ms must be >= 0")
     if args.sync_interval_ms <= 0:
         parser.error("--sync-interval-ms must be > 0")
+    if args.peer_timeout_ms <= 0:
+        parser.error("--peer-timeout-ms must be > 0")
+    if args.link_degraded_after_ms <= 0:
+        parser.error("--link-degraded-after-ms must be > 0")
+    if args.link_isolated_after_ms <= args.link_degraded_after_ms:
+        parser.error("--link-isolated-after-ms must be > --link-degraded-after-ms")
+    if args.link_move_after_ms <= args.link_isolated_after_ms:
+        parser.error("--link-move-after-ms must be > --link-isolated-after-ms")
+    if args.link_rtb_after_ms <= args.link_move_after_ms:
+        parser.error("--link-rtb-after-ms must be > --link-move-after-ms")
+    if args.link_recovery_hold_ms < 0:
+        parser.error("--link-recovery-hold-ms must be >= 0")
 
     try:
         inner_type = message_type_value(args.message_type)
@@ -896,7 +1109,48 @@ def main() -> int:
 
     seen = SeenRoutes(args.seen_limit)
     secure_replay = ReplayWindow(mesh_replay_window)
-    inner_payload = args.message.encode("utf-8") if args.message is not None else None
+    message_file_path = Path(args.message_file) if args.message_file is not None else None
+
+    def read_message_file(path: Path) -> bytes:
+        payload = path.read_bytes()
+        if len(payload) > MAX_U16:
+            raise ValueError(
+                f"message file payload must fit in u16 length, got {len(payload)} bytes"
+            )
+        return payload
+
+    if args.message is not None:
+        static_inner_payload: bytes | None = args.message.encode("utf-8")
+    elif message_file_path is not None:
+        try:
+            static_inner_payload = read_message_file(message_file_path)
+        except OSError as exc:
+            parser.error(f"--message-file read error: {exc}")
+        except ValueError as exc:
+            parser.error(str(exc))
+    else:
+        static_inner_payload = None
+
+    auto_status_payload = (
+        args.status_auto
+        and inner_type == MSG_STATUS
+        and static_inner_payload is None
+        and message_file_path is None
+    )
+
+    if args.count > 0 and static_inner_payload is None and not auto_status_payload:
+        parser.error("--count requires --message, --message-file, or --status-auto")
+
+    link_health = LinkHealthTracker(
+        sender_id=args.sender_id,
+        peer_timeout_ms=args.peer_timeout_ms,
+        degraded_after_ms=args.link_degraded_after_ms,
+        isolated_after_ms=args.link_isolated_after_ms,
+        move_after_ms=args.link_move_after_ms,
+        rtb_after_ms=args.link_rtb_after_ms,
+        recovery_hold_ms=args.link_recovery_hold_ms,
+    )
+    started_at = time.monotonic()
     next_origin_seq = _initial_seq()
     next_outer_seq = 1
     next_rf_seq = 1
@@ -911,6 +1165,36 @@ def main() -> int:
     def log(message: str) -> None:
         channel = "?" if current_channel is None else str(current_channel)
         print(f"CH={channel} {message}")
+
+    def status_flags(now: float) -> int:
+        flags = STATUS_FLAG_FORWARDING_ENABLED
+        if mesh_crypto is not None:
+            flags |= STATUS_FLAG_CRYPTO_ENABLED
+        if link_health.state in {
+            LINK_STATE_DEGRADED,
+            LINK_STATE_ISOLATED,
+            LINK_STATE_MOVING,
+            LINK_STATE_RTB,
+        }:
+            flags |= STATUS_FLAG_DEGRADED_LINK
+        return flags
+
+    def build_auto_status_payload(now: float) -> bytes:
+        uptime_s = int(max(0, now - started_at))
+        peer_count = min(255, link_health.active_peer_count(now))
+        return encode_status_payload(
+            uptime_s=uptime_s,
+            battery_pct=None,
+            peer_count=peer_count,
+            flags=status_flags(now),
+        )
+
+    def build_origin_payload(now: float) -> bytes | None:
+        if auto_status_payload:
+            return build_auto_status_payload(now)
+        if message_file_path is not None and args.message_file_reload:
+            return read_message_file(message_file_path)
+        return static_inner_payload
 
     def close_radio() -> None:
         nonlocal tx, rx
@@ -1325,6 +1609,21 @@ def main() -> int:
             f"dest={args.destination_id} class={traffic_class_name(traffic_class)}"
             f"{agility_desc}, Ctrl-C to exit"
         )
+        if auto_status_payload:
+            payload_desc = "auto-status"
+        elif message_file_path is not None:
+            payload_desc = f"file:{message_file_path}"
+        elif static_inner_payload is not None:
+            payload_desc = "text-message"
+        else:
+            payload_desc = "rx-forward-only"
+        log(
+            f"ORIGIN type={args.message_type} payload_source={payload_desc} "
+            f"peer_timeout_ms={args.peer_timeout_ms} "
+            f"degraded_ms={args.link_degraded_after_ms} "
+            f"isolated_ms={args.link_isolated_after_ms} "
+            f"moving_ms={args.link_move_after_ms} rtb_ms={args.link_rtb_after_ms}"
+        )
         state = current_schedule_state()
         if state is not None:
             log(
@@ -1350,9 +1649,22 @@ def main() -> int:
                 raise RuntimeError("radio handles are not open")
 
             now = time.monotonic()
+            transition = link_health.evaluate(now)
+            if transition is not None:
+                log(
+                    f"LINK state={transition.state} prev={transition.previous_state} "
+                    f"reason={transition.reason} inactive_ms={transition.inactive_ms} "
+                    f"active_peers={transition.active_peers}"
+                )
             tx_allowed = now >= tx_guard_until
+            try:
+                origin_payload = build_origin_payload(now)
+            except (OSError, ValueError) as exc:
+                log(f'PAYLOAD source_error="{exc}"')
+                next_tx_at = now + (args.tx_interval_ms / 1000.0)
+                origin_payload = None
             should_originate = (
-                inner_payload is not None
+                origin_payload is not None
                 and (args.count == 0 or originated_count < args.count)
                 and now >= next_tx_at
                 and tx_allowed
@@ -1361,7 +1673,7 @@ def main() -> int:
                 if use_route_v2:
                     sent_seq, e2e_crypto, sent_route = send_route_v2(
                         inner_type=inner_type,
-                        payload=inner_payload,
+                        payload=origin_payload,
                         destination_type=destination_type,
                         destination_id=args.destination_id,
                         ttl=args.ttl,
@@ -1375,7 +1687,7 @@ def main() -> int:
                         f"domain={security_domain_name(e2e_crypto.security_domain)} "
                         f"key_id={e2e_crypto.key_id} "
                         f"key_epoch={e2e_crypto.key_epoch} "
-                        f"len={len(inner_payload)}"
+                        f"len={len(origin_payload)}"
                     )
                     log(
                         f"TX route_v2 "
@@ -1383,7 +1695,7 @@ def main() -> int:
                         f"seq={sent_seq} "
                         f"dest={_addr_label(destination_type, args.destination_id)} "
                         f"ttl={args.ttl} class={traffic_class_name(traffic_class)} "
-                        f"type={args.message_type} len={len(inner_payload)} "
+                        f"type={args.message_type} len={len(origin_payload)} "
                         "e2e=1"
                     )
                     if (
@@ -1400,7 +1712,7 @@ def main() -> int:
                 else:
                     sent_seq, secured = send_route(
                         inner_type=inner_type,
-                        payload=inner_payload,
+                        payload=origin_payload,
                         destination_id=args.destination_id,
                         ttl=args.ttl,
                     )
@@ -1409,12 +1721,12 @@ def main() -> int:
                             f"TX secure origin={args.sender_id} seq={sent_seq} "
                             f"domain={security_domain_name(mesh_crypto.security_domain)} "
                             f"key_id={mesh_crypto.key_id} "
-                            f"key_epoch={mesh_crypto.key_epoch} len={len(inner_payload)}"
+                            f"key_epoch={mesh_crypto.key_epoch} len={len(origin_payload)}"
                         )
                     log(
                         f"TX route origin={args.sender_id} seq={sent_seq} "
                         f"dest={args.destination_id} ttl={args.ttl} "
-                        f"type={args.message_type} len={len(inner_payload)} "
+                        f"type={args.message_type} len={len(origin_payload)} "
                         f"secure={int(secured)}"
                     )
                 originated_count += 1
@@ -1472,6 +1784,7 @@ def main() -> int:
                     )
                     continue
 
+                link_health.note_peer(frame.sender_id, time.monotonic())
                 origin_label = _addr_label(route_v2.origin_type, route_v2.origin_id)
                 dest_label = _addr_label(
                     route_v2.destination_type,
@@ -1604,6 +1917,8 @@ def main() -> int:
                 )
                 continue
 
+            link_health.note_peer(frame.sender_id, time.monotonic())
+
             if route.origin_sender_id == args.sender_id:
                 seen.remember(route.dedupe_key)
                 log(
@@ -1677,13 +1992,44 @@ def main() -> int:
                             f"channel_match={int(local_channel == sync.channel)} "
                             f"next_hop_ms={sync.next_hop_ms}{suffix}"
                         )
+                elif route.inner_type == MSG_STATUS:
+                    try:
+                        status = decode_status_payload(route_payload)
+                    except AppFrameError as exc:
+                        log(
+                            f'RX invalid_status via={frame.sender_id} '
+                            f'origin={route.origin_sender_id} seq={route.origin_seq} '
+                            f'len={len(route_payload)} error="{exc}"'
+                        )
+                    else:
+                        log(
+                            f"RX status via={frame.sender_id} "
+                            f"origin={route.origin_sender_id} seq={route.origin_seq} "
+                            f"dest={route.destination_id} ttl={route.ttl} "
+                            f"uptime_s={status.uptime_s} "
+                            f"battery_pct={status.battery_pct} "
+                            f"peer_count={status.peer_count} "
+                            f"flags=0x{status.flags:02x} "
+                            f"degraded={int(status.degraded_link)} "
+                            f"crypto={int(status.crypto_enabled)} "
+                            f"forwarding={int(status.forwarding_enabled)}"
+                            f"{suffix}"
+                        )
                 else:
-                    text = route_payload.decode("utf-8", errors="replace")
-                    payload_text = (
-                        "[encrypted]"
-                        if route_secured
-                        else f'"{text}"'
-                    )
+                    if route_secured:
+                        payload_text = "[encrypted]"
+                    else:
+                        try:
+                            decoded = route_payload.decode("utf-8")
+                            if all(
+                                ch.isprintable() or ch in {"\r", "\n", "\t"}
+                                for ch in decoded
+                            ):
+                                payload_text = f'"{decoded}"'
+                            else:
+                                payload_text = f"[{len(route_payload)} bytes]"
+                        except UnicodeDecodeError:
+                            payload_text = f"[{len(route_payload)} bytes]"
                     log(
                         f'RX deliver via={frame.sender_id} '
                         f'origin={route.origin_sender_id} seq={route.origin_seq} '

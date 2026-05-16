@@ -164,6 +164,13 @@ frames during debugging.
   `stream_id = 0xdeadbeef`, producing `57:42:de:ad:be:ef` in captures.
 - `python/examples/simple_txrx.py` and `python/examples/mesh_txrx.py` default to
   `0xdeadbeef` when no stream id is supplied.
+- `mesh_txrx.py` now includes a local link-health state machine with transitions
+  `nominal -> degraded -> isolated -> moving -> rtb` and recovery back toward
+  `nominal` when links return.
+- `mesh_txrx.py` now auto-generates binary `status` payloads in `--status-auto`
+  mode and logs decoded structured status fields on receive.
+- `mesh_txrx.py` now supports `--message-file` and `--message-file-reload` for
+  binary demo payloads (for example camera snapshots).
 - Live tests have validated three nodes using TTL forwarding, deduplication,
   channel hopping, and sync heartbeats.
 - Secure mesh mode still needs a live three-node RF test.
@@ -1075,10 +1082,12 @@ Later status fields:
 - retry/loss estimates
 - GPS/position if available
 
-Remaining integration work:
+Current runtime behavior:
 
-- Ensure runtime status producers in examples use this binary payload
-  consistently where status is transmitted.
+- `mesh_txrx.py` emits structured binary status payloads by default when
+  `message_type=status` and no explicit payload is provided.
+- Status `flags` now carry runtime link/crypto/forwarding state for local
+  decision and demo observability.
 
 ### 18. Channel Agility Hardening
 

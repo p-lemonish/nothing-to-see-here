@@ -24,6 +24,7 @@ from wfb_rs_py.app_proto import (
     ADDR_NODE,
     AppFrameError,
     CHACHA20_POLY1305_KEY_SIZE,
+    MSG_DATA,
     MSG_ROUTE_DATA,
     MSG_ROUTE_V2,
     MSG_STATUS,
@@ -698,7 +699,7 @@ def main() -> int:
     parser.add_argument(
         "--message-file",
         default=config_defaults.get("message_file"),
-        help="optional binary payload file to originate (for data/image demo payloads)",
+        help="optional binary payload file to originate (requires --message-type=data)",
     )
     parser.add_argument(
         "--message-file-reload",
@@ -948,6 +949,8 @@ def main() -> int:
         parser.error("--message-type cannot be a route packet type")
     if inner_type == MSG_SYNC:
         parser.error("--message-type sync is reserved for --sync-heartbeat")
+    if args.message_file is not None and inner_type != MSG_DATA:
+        parser.error("--message-file requires --message-type=data")
 
     mesh_crypto_enabled = bool(config_defaults.get("mesh_crypto_enabled", False))
     mesh_replay_window = int(config_defaults.get("mesh_crypto_replay_window", 4096))
@@ -1097,7 +1100,12 @@ def main() -> int:
                 default_domain=SEC_DOMAIN_C2_TO_NODE,
             ),
         )
-    if args.message is not None:
+    has_originated_payload = (
+        args.message is not None
+        or args.message_file is not None
+        or (args.status_auto and inner_type == MSG_STATUS)
+    )
+    if has_originated_payload:
         if traffic_class == TRAFFIC_C2_UPLINK and c2_uplink_crypto is None:
             parser.error(
                 "traffic_class=c2_uplink requires [c2_uplink_crypto] enabled=true"
